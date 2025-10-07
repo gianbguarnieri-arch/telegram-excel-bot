@@ -18,8 +18,8 @@ CLIENT_ID = os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
-# ⚠️ Sem valor padrão para evitar cair em /me/ (delegated)
-EXCEL_PATH = os.getenv("EXCEL_PATH")  # ex.: /users/.../drive/items/FILE_ID  ou  /users/.../drive/root:/Documents/Planilhas/Lancamentos.xlsx
+# ⚙️ Sanitiza espaços e quebras de linha no caminho
+EXCEL_PATH = (os.getenv("EXCEL_PATH") or "").strip()
 WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "Plan1")
 TABLE_NAME = os.getenv("TABLE_NAME", "Lancamentos")
 SCOPE = ["https://graph.microsoft.com/.default"]
@@ -39,6 +39,7 @@ def msal_token():
         raise RuntimeError(f"MSAL error: {result}")
     return result["access_token"]
 
+
 def excel_add_row(values):
     """
     Adiciona uma linha na Tabela do Excel.
@@ -53,25 +54,34 @@ def excel_add_row(values):
 
     token = msal_token()
 
+    # Monta URL dependendo do formato
     if "/drive/items/" in EXCEL_PATH:
-        # Formato por ID (NÃO usa ':')
+        # Caminho por ID (não usa ':')
         url = (
             f"{GRAPH_BASE}{EXCEL_PATH}"
             f"/workbook/worksheets('{WORKSHEET_NAME}')/tables('{TABLE_NAME}')/rows/add"
         )
     else:
-        # Formato por caminho (usa ':')
+        # Caminho por rota (usa ':')
         url = (
             f"{GRAPH_BASE}{EXCEL_PATH}"
             f":/workbook/worksheets('{WORKSHEET_NAME}')/tables('{TABLE_NAME}')/rows/add"
         )
 
     payload = {"values": [values]}
-    r = requests.post(url, headers={"Authorization": f"Bearer {token}"}, json=payload, timeout=25)
+    r = requests.post(
+        url,
+        headers={"Authorization": f"Bearer {token}"},
+        json=payload,
+        timeout=25
+    )
     if r.status_code >= 300:
-        raise RuntimeError(f"Graph error {r.status_code}: {r.text}")
+        # Mostra a URL completa para debug
+        raise RuntimeError(f"Graph error {r.status_code}: url={url} resp={r.text}")
     return r.json()
 
+
+# ===== Processamento do comando /add =====
 ADD_REGEX = re.compile(r"^/add\s+(.+)$", re.IGNORECASE)
 
 def parse_add(text):
@@ -105,6 +115,8 @@ def parse_add(text):
     origem = "Telegram"
     return [data_iso, tipo, categoria, descricao, valor, forma, origem], None
 
+
+# ===== Envio de mensagens ao Telegram =====
 async def tg_send(chat_id, text):
     async with httpx.AsyncClient(timeout=12) as client:
         await client.post(
@@ -112,10 +124,12 @@ async def tg_send(chat_id, text):
             json={"chat_id": chat_id, "text": text},
         )
 
-# ===== Routes =====
+
+# ===== Rotas =====
 @app.get("/")
 def root():
     return {"status": "ok"}
+
 
 @app.post("/telegram/webhook")
 async def telegram_webhook(req: Request):
@@ -137,16 +151,4 @@ async def telegram_webhook(req: Request):
         return {"ok": True}
 
     # /add ...
-    row, err = parse_add(text)
-    if err:
-        await tg_send(chat_id, f"❗ {err}")
-        return {"ok": True}
-
-    try:
-        excel_add_row(row)
-        await tg_send(chat_id, "✅ Lançamento adicionado com sucesso!")
-    except Exception as e:
-        # Retorna o erro bruto para depuração inicial
-        await tg_send(chat_id, f"❌ Erro ao lançar no Excel: {e}")
-
-    return {"ok": True}
+    row, er
