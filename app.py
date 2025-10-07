@@ -25,7 +25,7 @@ CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
 # Sanitiza caminho e define defaults
-EXCEL_PATH = (os.getenv("EXCEL_PATH") or "").strip()  # ex.: /users/.../drive/items/ID  OU  /users/.../drive/root:/Documents/Planilhas/Lancamentos.xlsx
+EXCEL_PATH = (os.getenv("EXCEL_PATH") or "").strip()  # /users/.../drive/items/ID  OU  /users/.../drive/root:/Documents/Planilhas/Lancamentos.xlsx
 WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "Plan1")
 TABLE_NAME = os.getenv("TABLE_NAME", "Lancamentos")
 SCOPE = ["https://graph.microsoft.com/.default"]
@@ -114,26 +114,45 @@ def _parse_space6(payload: str):
 
 def _normalize_date_br(s: str) -> str:
     """
-    Aceita: 'DD/MM', 'DD/MM/AAAA', 'DD-MM', 'DD-MM-AAAA', 'hoje', 'ontem'.
+    Aceita: 'DD/MM', 'DD/MM/AAAA', 'DD-MM', 'DD-MM-AAAA', 'DD.MM', 'hoje', 'ontem'.
     Retorna sempre 'DD/MM/AAAA' (ano atual quando faltando).
     """
-    txt = s.strip().lower()
+    txt = (s or "").strip().lower()
     hoje = datetime.now()
     if txt == "hoje":
         return hoje.strftime("%d/%m/%Y")
     if txt == "ontem":
         return (hoje - timedelta(days=1)).strftime("%d/%m/%Y")
 
+    # normaliza separadores
     txt = txt.replace("-", "/").replace(".", "/")
-    parts = [p for p in txt.split("/") if p]
-    if len(parts) == 2:
-        d, m = parts
-        return f"{int(d):02d}/{int(m):02d}/{hoje.year}"
-    if len(parts) == 3:
-        d, m, y = parts
-        if len(y) == 2:
+    # extrai grupos com regex robusta
+    m = re.search(r"(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?$", txt)
+    if not m:
+        return s  # devolve original e deixa o chamador validar
+    d, mth, y = m.group(1), m.group(2), m.group(3)
+    if not y:
+        y = str(hoje.year)
+    elif len(y) == 2:
+        y = f"20{y}"
+    return f"{int(d):02d}/{int(mth):02d}/{int(y):04d}"
+
+def _force_date_ddmmyyyy(s: str) -> str:
+    """
+    Força a extração da primeira data válida do texto e retorna DD/MM/AAAA.
+    """
+    if not s:
+        return s
+    txt = s.strip().lower().replace("-", "/").replace(".", "/")
+    # tenta achar uma data em qualquer lugar
+    m = re.search(r"(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?", txt)
+    if m:
+        d, mth, y = m.group(1), m.group(2), m.group(3)
+        if not y:
+            y = str(datetime.now().year)
+        elif len(y) == 2:
             y = f"20{y}"
-        return f"{int(d):02d}/{int(m):02d}/{int(y):04d}"
+        return f"{int(d):02d}/{int(mth):02d}/{int(y):04d}"
     return s
 
 def _parse_freeform(text: str):
@@ -145,7 +164,7 @@ def _parse_freeform(text: str):
     original = text
     t = _strip_accents(text.lower())
 
-    # data
+    # data (inclui hoje/ontem)
     m_data = re.search(r"(\b\d{1,2}[\/\.-]\d{1,2}(?:[\/\.-]\d{2,4})?\b|\bhoje\b|\bontem\b)", t)
     if m_data:
         data_br = _normalize_date_br(m_data.group(1))
@@ -182,7 +201,7 @@ def _parse_freeform(text: str):
     else:
         tipo = "Compra"
 
-    # categoria (heurística simples)
+    # categoria
     categorias_vocab = [
         "mercado", "supermercado", "farmacia", "combustivel", "gasolina",
         "restaurante", "almoço", "almoco", "taxi", "uber", "aluguel",
@@ -199,7 +218,6 @@ def _parse_freeform(text: str):
     if m_data:
         desc = re.sub(m_data.group(1), "", desc, flags=re.IGNORECASE)
     desc = desc.replace(valor_str, "")
-
     remove_words = ["gastei", "paguei", "recebi", "ganhei", "com", "no", "na", "do", "da", "de", "para", "pra", "o", "a", "no dia", "dia"]
     for w in remove_words + list(formas.keys()):
         desc = re.sub(rf"\b{w}\b", "", _strip_accents(desc).lower(), flags=re.IGNORECASE)
@@ -234,12 +252,16 @@ def parse_add(text):
                           "• /add 07/10/2025;Compra;Mercado;Almoço do time;45,90;Cartão")
         data_br, tipo, categoria, descricao, valor_str, forma = fr
 
+    # força dd/mm/aaaa caso haja caracteres estranhos
+    data_br = _force_date_ddmmyyyy(data_br)
+
     # Data → ISO
     try:
         dt = datetime.strptime(data_br, "%d/%m/%Y")
         data_iso = dt.strftime("%Y-%m-%d")
-    except Exception:
-        return None, "Data inválida. Use DD/MM/AAAA."
+    except Exception as e:
+        logger.error("Falha ao parsear data. data_br='%s' erro=%s", data_br, e)
+        return None, f"Data inválida: '{data_br}'. Use DD/MM/AAAA (ex.: 07/10/2025)."
 
     # Valor
     try:
