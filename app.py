@@ -84,6 +84,7 @@ def excel_add_row(values):
 
 # ===== Parsing util =====
 ADD_CMD = re.compile(r"^\/?add\b", re.IGNORECASE)
+TRIGGER_RE = re.compile(r"(\d{1,3}(?:\.\d{3})*,\d{2}|\d+[,\.]\d{2})")  # detecta "45,90" ou "45.90"
 
 def _strip_accents(s: str) -> str:
     return "".join(ch for ch in unicodedata.normalize("NFD", s) if unicodedata.category(ch) != "Mn")
@@ -168,6 +169,8 @@ def _parse_freeform(text: str):
     """
     original = text
     t = _strip_accents(text.lower())
+    # remove vírgulas/pontos soltos no fim de tokens (ex.: "cartão," -> "cartão")
+    t = re.sub(r"([a-z0-9áéíóúãõç]+)[\.,](\s|$)", r"\1\2", t, flags=re.IGNORECASE)
 
     # data (inclui hoje/ontem)
     m_data = re.search(r"(\b\d{1,2}[\/\.-]\d{1,2}(?:[\/\.-]\d{2,4})?\b|\bhoje\b|\bontem\b)", t)
@@ -326,8 +329,13 @@ async def telegram_webhook(req: Request):
             await tg_send(chat_id, reply)
             return {"ok": True}
 
-        # add via comando ou frase natural
-        if ADD_CMD.match(text) or text.lower().startswith(("gastei", "paguei", "recebi", "ganhei")):
+        # add via comando, frase natural, ou qualquer mensagem que contenha um valor (ex.: 45,90)
+        lower_txt = text.lower()
+        if (
+            ADD_CMD.match(text)
+            or lower_txt.startswith(("gastei", "paguei", "recebi", "ganhei"))
+            or TRIGGER_RE.search(lower_txt)
+        ):
             row, err = parse_add(text)
             if err:
                 await tg_send(chat_id, f"❗ {err}")
