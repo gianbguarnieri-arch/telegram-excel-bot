@@ -63,7 +63,7 @@ def interpretar_frase(texto):
     # forma de pagamento
     if "pix" in texto:
         forma = "Pix"
-    elif "cartão" in texto or "credito" in texto or "débito" in texto:
+    elif "cartão" in texto or "credito" in texto or "débito" in texto or "debito" in texto:
         forma = "Cartão"
     elif "dinheiro" in texto:
         forma = "Dinheiro"
@@ -77,10 +77,16 @@ def interpretar_frase(texto):
     elif "hoje" in texto:
         data = hoje
     else:
-        match_data = re.search(r"(\d{1,2}/\d{1,2}/\d{4})", texto)
+        match_data = re.search(r"(\d{1,2}/\d{1,2}/\d{2,4})", texto)
         if match_data:
+            ds = match_data.group(1)
+            # completa ano se vier dd/mm
+            if re.match(r"^\d{1,2}/\d{1,2}/\d{2}$", ds):
+                ds = ds[:6] + "20" + ds[-2:]
+            if re.match(r"^\d{1,2}/\d{1,2}$", ds):
+                ds = ds + f"/{hoje.year}"
             try:
-                data = datetime.strptime(match_data.group(1), "%d/%m/%Y")
+                data = datetime.strptime(ds, "%d/%m/%Y")
             except:
                 return None, "Data inválida."
         else:
@@ -88,23 +94,32 @@ def interpretar_frase(texto):
 
     data_iso = data.strftime("%Y-%m-%d")
 
-    # tipo e categoria
-    tipo = "Compra" if "gastei" in texto or "paguei" in texto else "Receita" if "recebi" in texto else "Movimento"
+    # tipo
+    if "recebi" in texto or "entrada" in texto or "venda" in texto or "ganhei" in texto:
+        tipo = "Receita"
+    elif "gastei" in texto or "paguei" in texto or "compra" in texto:
+        tipo = "Compra"
+    else:
+        tipo = "Movimento"
 
     # categorias simples
     categorias = {
         "mercado": "Alimentação",
         "supermercado": "Alimentação",
         "gasolina": "Transporte",
+        "combustivel": "Transporte",
         "uber": "Transporte",
         "ifood": "Alimentação",
         "almoço": "Alimentação",
+        "almoco": "Alimentação",
         "aluguel": "Moradia",
         "luz": "Contas",
         "energia": "Contas",
         "água": "Contas",
+        "agua": "Contas",
         "netflix": "Entretenimento",
         "spotify": "Entretenimento",
+        "farmacia": "Saúde",
     }
     categoria = "Outros"
     for palavra, cat in categorias.items():
@@ -151,6 +166,10 @@ async def telegram_webhook(req: Request):
                 print(f"[DEBUG] Erro de parsing: {erro}")
             return {"ok": True}
 
+        if DEBUG:
+            di, ti, ca, de, va, fo, _ = dados
+            await tg_send(chat_id, f"[DEBUG]\nData: {di}\nTipo: {ti}\nCat: {ca}\nDesc: {de}\nValor: {va:.2f}\nForma: {fo}")
+
         excel_add_row(dados)
         await tg_send(chat_id, "✅ Lançado!")
     except Exception as e:
@@ -159,4 +178,4 @@ async def telegram_webhook(req: Request):
         if DEBUG:
             print(f"[DEBUG] {msg_erro}")
 
-    return {"ok": True"}
+    return {"ok": True}
