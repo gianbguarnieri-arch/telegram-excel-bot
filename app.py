@@ -100,16 +100,22 @@ def _parse_semicolon(payload: str):
     return None
 
 def _parse_space6(payload: str):
-    # /add DD/MM[/AAAA] Tipo Categoria Descricao Valor Forma
+    """
+    Formato estruturado por espaços, só se o primeiro token for uma data:
+    /add DD/MM[/AAAA] Tipo Categoria Descricao Valor Forma
+    """
     toks = payload.split()
     if len(toks) >= 6:
-        data = toks[0]
-        tipo = toks[1]
-        categoria = toks[2]
-        desc = " ".join(toks[3:-2]).replace("_", " ")
-        valor = toks[-2]
-        forma = toks[-1]
-        return [data, tipo, categoria, desc, valor, forma]
+        first = toks[0]
+        # aceita DD/MM, DD-MM, DD.MM, DD/MM/AAAA, etc.
+        if re.match(r"^\d{1,2}[\/\.-]\d{1,2}([\/\.-]\d{2,4})?$", first):
+            data = first
+            tipo = toks[1]
+            categoria = toks[2]
+            desc = " ".join(toks[3:-2]).replace("_", " ")
+            valor = toks[-2]
+            forma = toks[-1]
+            return [data, tipo, categoria, desc, valor, forma]
     return None
 
 def _normalize_date_br(s: str) -> str:
@@ -129,7 +135,7 @@ def _normalize_date_br(s: str) -> str:
     # extrai grupos com regex robusta
     m = re.search(r"(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?$", txt)
     if not m:
-        return s  # devolve original e deixa o chamador validar
+        return s  # devolve original; o chamador valida
     d, mth, y = m.group(1), m.group(2), m.group(3)
     if not y:
         y = str(hoje.year)
@@ -144,7 +150,6 @@ def _force_date_ddmmyyyy(s: str) -> str:
     if not s:
         return s
     txt = s.strip().lower().replace("-", "/").replace(".", "/")
-    # tenta achar uma data em qualquer lugar
     m = re.search(r"(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?", txt)
     if m:
         d, mth, y = m.group(1), m.group(2), m.group(3)
@@ -236,20 +241,30 @@ def parse_add(text):
     Retorna: [DataISO, Tipo, Categoria, Descricao, ValorFloat, Forma, Origem]
     """
     raw = text.strip()
-    payload = ADD_CMD.sub("", raw, count=1).strip() if ADD_CMD.match(raw) else raw
+    is_cmd = bool(ADD_CMD.match(raw))
+    payload = ADD_CMD.sub("", raw, count=1).strip() if is_cmd else raw
 
-    # estruturados
-    parts = _parse_semicolon(payload) or _parse_space6(payload)
-    if parts:
-        data_br, tipo, categoria, descricao, valor_str, forma = parts
-        data_br = _normalize_date_br(data_br)
+    if is_cmd:
+        # Mensagens começando com /add: tenta estruturado; se falhar, cai para natural.
+        parts = _parse_semicolon(payload) or _parse_space6(payload)
+        if parts:
+            data_br, tipo, categoria, descricao, valor_str, forma = parts
+            data_br = _normalize_date_br(data_br)
+        else:
+            fr = _parse_freeform(payload)
+            if not fr:
+                return None, ("Não entendi. Exemplos:\n"
+                              "• gastei 45,90 no mercado com cartão, almoço do time dia 07/10\n"
+                              "• /add 07/10 compra mercado almoço_do_time 45,90 cartão\n"
+                              "• /add 07/10/2025;Compra;Mercado;Almoço do time;45,90;Cartão")
+            data_br, tipo, categoria, descricao, valor_str, forma = fr
     else:
+        # Sem /add → trata como frase natural diretamente
         fr = _parse_freeform(payload)
         if not fr:
             return None, ("Não entendi. Exemplos:\n"
                           "• gastei 45,90 no mercado com cartão, almoço do time dia 07/10\n"
-                          "• /add 07/10 compra mercado almoço_do_time 45,90 cartão\n"
-                          "• /add 07/10/2025;Compra;Mercado;Almoço do time;45,90;Cartão")
+                          "• /add 07/10 compra mercado almoço_do_time 45,90 cartão")
         data_br, tipo, categoria, descricao, valor_str, forma = fr
 
     # força dd/mm/aaaa caso haja caracteres estranhos
