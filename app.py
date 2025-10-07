@@ -84,13 +84,15 @@ def excel_add_row(values):
 
 # ===== Parsing util =====
 ADD_CMD = re.compile(r"^\/?add\b", re.IGNORECASE)
-TRIGGER_RE = re.compile(r"(\d{1,3}(?:\.\d{3})*,\d{2}|\d+[,\.]\d{2})")  # detecta "45,90" ou "45.90"
+MONEY_RE = re.compile(r"(?:r\$\s*)?(\d{1,3}(?:\.\d{3})*,\d{2}|\d+[,\.]\d{2})", re.IGNORECASE)
+DATE_ANY_RE = re.compile(r"(\b\d{1,2}[\/\.-]\d{1,2}(?:[\/\.-]\d{2,4})?\b|\bhoje\b|\bontem\b)", re.IGNORECASE)
 
 def _strip_accents(s: str) -> str:
     return "".join(ch for ch in unicodedata.normalize("NFD", s) if unicodedata.category(ch) != "Mn")
 
 def _to_float_br(num_str: str) -> float:
     s = num_str.strip().replace(" ", "")
+    s = s.replace("R$", "").replace("r$", "").strip()
     s = s.replace(".", "").replace(",", ".")
     return float(s)
 
@@ -136,7 +138,7 @@ def _normalize_date_br(s: str) -> str:
     # extrai grupos com regex robusta
     m = re.search(r"(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?$", txt)
     if not m:
-        return s  # devolve original; o chamador valida
+        return s
     d, mth, y = m.group(1), m.group(2), m.group(3)
     if not y:
         y = str(hoje.year)
@@ -161,6 +163,17 @@ def _force_date_ddmmyyyy(s: str) -> str:
         return f"{int(d):02d}/{int(mth):02d}/{int(y):04d}"
     return s
 
+def _clean_text_for_freeform(text: str) -> str:
+    """
+    Limpa ruídos comuns: remove acentos, retira 'R$', vírgulas/pontos soltos no fim, e normaliza espaços.
+    """
+    t = text.replace("R$", "R$ ").replace("r$", "r$ ")
+    t = _strip_accents(t.lower())
+    # remove vírgulas/pontos soltos no fim de tokens (ex.: "cartão," -> "cartao")
+    t = re.sub(r"([a-z0-9]+)[\.,](\s|$)", r"\1\2", t, flags=re.IGNORECASE)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
 def _parse_freeform(text: str):
     """
     Frase natural, ex:
@@ -168,21 +181,19 @@ def _parse_freeform(text: str):
     Retorna [data, tipo, categoria, descricao, valor, forma] (strings)
     """
     original = text
-    t = _strip_accents(text.lower())
-    # remove vírgulas/pontos soltos no fim de tokens (ex.: "cartão," -> "cartão")
-    t = re.sub(r"([a-z0-9áéíóúãõç]+)[\.,](\s|$)", r"\1\2", t, flags=re.IGNORECASE)
+    t = _clean_text_for_freeform(text)
 
-    # data (inclui hoje/ontem)
-    m_data = re.search(r"(\b\d{1,2}[\/\.-]\d{1,2}(?:[\/\.-]\d{2,4})?\b|\bhoje\b|\bontem\b)", t)
+    # data (inclui hoje/ontem). se não achar, assume hoje
+    m_data = DATE_ANY_RE.search(t)
     if m_data:
         data_br = _normalize_date_br(m_data.group(1))
     else:
         data_br = datetime.now().strftime("%d/%m/%Y")
 
-    # valor
-    m_valor = re.search(r"(\d{1,3}(?:\.\d{3})*,\d{2}|\d+[,\.]\d{2})", t)
+    # valor (obrigatório para lançar)
+    m_valor = MONEY_RE.search(t)
     if not m_valor:
-        return None
+        return None  # sem valor, não dá para lançar
     valor_str = m_valor.group(1)
 
     # forma
@@ -209,10 +220,10 @@ def _parse_freeform(text: str):
     else:
         tipo = "Compra"
 
-    # categoria
+    # categoria (heurística simples)
     categorias_vocab = [
         "mercado", "supermercado", "farmacia", "combustivel", "gasolina",
-        "restaurante", "almoço", "almoco", "taxi", "uber", "aluguel",
+        "restaurante", "almoco", "taxi", "uber", "aluguel",
         "luz", "agua", "internet", "padaria"
     ]
     categoria = "Geral"
@@ -221,21 +232,19 @@ def _parse_freeform(text: str):
             categoria = "Mercado" if kw in ("mercado", "supermercado") else kw.capitalize()
             break
 
-    # descrição = original menos termos óbvios
+    # descrição básica a partir do original, removendo valor e a data encontrada
     desc = re.sub(ADD_CMD, "", original, flags=re.IGNORECASE).strip()
     if m_data:
         desc = re.sub(m_data.group(1), "", desc, flags=re.IGNORECASE)
-    desc = desc.replace(valor_str, "")
-    remove_words = ["gastei", "paguei", "recebi", "ganhei", "com", "no", "na", "do", "da", "de", "para", "pra", "o", "a", "no dia", "dia"]
-    for w in remove_words + list(formas.keys()):
-        desc = re.sub(rf"\b{w}\b", "", _strip_accents(desc).lower(), flags=re.IGNORECASE)
-    desc = " ".join(tok for tok in desc.replace("  ", " ").strip().split())
+    desc = re.sub(r"R\$\s*", "", desc, flags=re.IGNORECASE)
+    desc = desc.replace(m_valor.group(0), "")  # valor com ou sem R$
+    desc = " ".join(desc.split()).strip(" ,.-")
     if not desc:
         desc = f"{tipo} {categoria}"
 
     return [data_br, tipo, categoria, desc, valor_str, forma]
 
-def parse_add(text):
+def parse_add(text: str):
     """
     Aceita:
       - "/add DD/MM[/AAAA];Tipo;Categoria;Descricao;Valor;Forma"
@@ -248,7 +257,6 @@ def parse_add(text):
     payload = ADD_CMD.sub("", raw, count=1).strip() if is_cmd else raw
 
     if is_cmd:
-        # Mensagens começando com /add: tenta estruturado; se falhar, cai para natural.
         parts = _parse_semicolon(payload) or _parse_space6(payload)
         if parts:
             data_br, tipo, categoria, descricao, valor_str, forma = parts
@@ -262,15 +270,12 @@ def parse_add(text):
                               "• /add 07/10/2025;Compra;Mercado;Almoço do time;45,90;Cartão")
             data_br, tipo, categoria, descricao, valor_str, forma = fr
     else:
-        # Sem /add → trata como frase natural diretamente
         fr = _parse_freeform(payload)
         if not fr:
-            return None, ("Não entendi. Exemplos:\n"
-                          "• gastei 45,90 no mercado com cartão, almoço do time dia 07/10\n"
-                          "• /add 07/10 compra mercado almoço_do_time 45,90 cartão")
+            return None, ("Me diga pelo menos um valor, por ex.: 'gastei 45,90 mercado cartão hoje'.")
         data_br, tipo, categoria, descricao, valor_str, forma = fr
 
-    # força dd/mm/aaaa caso haja caracteres estranhos
+    # força dd/mm/aaaa
     data_br = _force_date_ddmmyyyy(data_br)
 
     # Data → ISO
@@ -329,13 +334,12 @@ async def telegram_webhook(req: Request):
             await tg_send(chat_id, reply)
             return {"ok": True}
 
-        # add via comando, frase natural, ou qualquer mensagem que contenha um valor (ex.: 45,90)
+        # ===== Quando devemos tentar interpretar como lançamento? =====
         lower_txt = text.lower()
-        if (
-            ADD_CMD.match(text)
-            or lower_txt.startswith(("gastei", "paguei", "recebi", "ganhei"))
-            or TRIGGER_RE.search(lower_txt)
-        ):
+        has_money = bool(MONEY_RE.search(lower_txt))
+        has_digits = any(ch.isdigit() for ch in lower_txt)
+
+        if ADD_CMD.match(text) or has_money or lower_txt.startswith(("gastei", "paguei", "recebi", "ganhei")) or has_digits:
             row, err = parse_add(text)
             if err:
                 await tg_send(chat_id, f"❗ {err}")
@@ -354,6 +358,7 @@ async def telegram_webhook(req: Request):
                 await tg_send(chat_id, f"❌ Erro ao lançar no Excel: {e}")
             return {"ok": True}
 
+        # Se não for nada disso, ignoramos silenciosamente
         return {"ok": True}
 
     except Exception:
