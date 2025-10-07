@@ -2,14 +2,14 @@ import os
 import re
 import logging
 import unicodedata
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from fastapi import FastAPI, Request
 import requests
 import httpx
 import msal
 
-# ===== Logging básico =====
+# ===== Logging =====
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -24,14 +24,13 @@ CLIENT_ID = os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
-# ⚙️ Sanitiza espaços e quebras de linha
-EXCEL_PATH = (os.getenv("EXCEL_PATH") or "").strip()
+# Sanitiza caminho e define defaults
+EXCEL_PATH = (os.getenv("EXCEL_PATH") or "").strip()  # ex.: /users/.../drive/items/ID  OU  /users/.../drive/root:/Documents/Planilhas/Lancamentos.xlsx
 WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "Plan1")
 TABLE_NAME = os.getenv("TABLE_NAME", "Lancamentos")
 SCOPE = ["https://graph.microsoft.com/.default"]
 
-
-# ===== Helpers =====
+# ===== MSAL / Graph helpers =====
 def msal_token():
     """Token app-only (client credentials) para Microsoft Graph."""
     if not (TENANT_ID and CLIENT_ID and CLIENT_SECRET):
@@ -48,15 +47,12 @@ def msal_token():
         raise RuntimeError(f"MSAL error: {result}")
     return result["access_token"]
 
-
 def excel_add_row(values):
     """
     Adiciona uma linha na Tabela do Excel.
-    Suporta EXCEL_PATH em dois formatos:
-      1) Por caminho (rota): /users/.../drive/root:/Documents/Planilhas/Lancamentos.xlsx
-         → usa ':/workbook/...'
-      2) Por ID:             /users/.../drive/items/01ABC...!123
-         → usa '/workbook/...'
+    Suporta EXCEL_PATH:
+      1) Por caminho: /users/.../drive/root:/Documents/Planilhas/Lancamentos.xlsx  → usa ':/workbook/...'
+      2) Por ID:      /users/.../drive/items/01ABC...!123                        → usa '/workbook/...'
     """
     if not EXCEL_PATH:
         raise RuntimeError("EXCEL_PATH não definido nas variáveis de ambiente.")
@@ -86,15 +82,13 @@ def excel_add_row(values):
         raise RuntimeError(f"Graph error {r.status_code}: url={graph_url} resp={r.text}")
     return r.json()
 
-
-# ===== Parser “frase natural” + compat =====
+# ===== Parsing util =====
 ADD_CMD = re.compile(r"^\/?add\b", re.IGNORECASE)
 
 def _strip_accents(s: str) -> str:
     return "".join(ch for ch in unicodedata.normalize("NFD", s) if unicodedata.category(ch) != "Mn")
 
 def _to_float_br(num_str: str) -> float:
-    # aceita "1.234,56" ou "1234,56" ou "1234.56"
     s = num_str.strip().replace(" ", "")
     s = s.replace(".", "").replace(",", ".")
     return float(s)
@@ -106,20 +100,41 @@ def _parse_semicolon(payload: str):
     return None
 
 def _parse_space6(payload: str):
-    # /add DD/MM/AAAA Tipo Categoria Descricao Valor Forma
-    # para permitir espaços na descrição, usuário pode usar _ (almoço_do_time)
+    # /add DD/MM[/AAAA] Tipo Categoria Descricao Valor Forma
     toks = payload.split()
     if len(toks) >= 6:
-        # une “sobras” no meio para sempre fechar 6 campos
         data = toks[0]
         tipo = toks[1]
         categoria = toks[2]
-        # descrição pode ter vários tokens; pega tudo até o penúltimo
         desc = " ".join(toks[3:-2]).replace("_", " ")
         valor = toks[-2]
         forma = toks[-1]
         return [data, tipo, categoria, desc, valor, forma]
     return None
+
+def _normalize_date_br(s: str) -> str:
+    """
+    Aceita: 'DD/MM', 'DD/MM/AAAA', 'DD-MM', 'DD-MM-AAAA', 'hoje', 'ontem'.
+    Retorna sempre 'DD/MM/AAAA' (ano atual quando faltando).
+    """
+    txt = s.strip().lower()
+    hoje = datetime.now()
+    if txt == "hoje":
+        return hoje.strftime("%d/%m/%Y")
+    if txt == "ontem":
+        return (hoje - timedelta(days=1)).strftime("%d/%m/%Y")
+
+    txt = txt.replace("-", "/").replace(".", "/")
+    parts = [p for p in txt.split("/") if p]
+    if len(parts) == 2:
+        d, m = parts
+        return f"{int(d):02d}/{int(m):02d}/{hoje.year}"
+    if len(parts) == 3:
+        d, m, y = parts
+        if len(y) == 2:
+            y = f"20{y}"
+        return f"{int(d):02d}/{int(m):02d}/{int(y):04d}"
+    return s
 
 def _parse_freeform(text: str):
     """
@@ -130,23 +145,20 @@ def _parse_freeform(text: str):
     original = text
     t = _strip_accents(text.lower())
 
-    # 1) data (dd/mm ou dd/mm/aaaa)
-    m_data = re.search(r"(\b\d{1,2}/\d{1,2}(?:/\d{2,4})?\b)", t)
+    # data
+    m_data = re.search(r"(\b\d{1,2}[\/\.-]\d{1,2}(?:[\/\.-]\d{2,4})?\b|\bhoje\b|\bontem\b)", t)
     if m_data:
-        data_br = m_data.group(1)
-        if len(data_br.split("/")) == 2:
-            # completa com ano atual
-            data_br = f"{data_br}/{datetime.now().year}"
+        data_br = _normalize_date_br(m_data.group(1))
     else:
         data_br = datetime.now().strftime("%d/%m/%Y")
 
-    # 2) valor (pega a 1ª ocorrência que pareça dinheiro)
+    # valor
     m_valor = re.search(r"(\d{1,3}(?:\.\d{3})*,\d{2}|\d+[,\.]\d{2})", t)
     if not m_valor:
-        return None  # sem valor não dá
+        return None
     valor_str = m_valor.group(1)
 
-    # 3) forma de pagamento
+    # forma
     formas = {
         "pix": "Pix",
         "cartao": "Cartão",
@@ -164,13 +176,13 @@ def _parse_freeform(text: str):
             forma = v
             break
 
-    # 4) tipo (receita/compra)
+    # tipo
     if re.search(r"\b(receita|entrada|recebi|venda|ganhei)\b", t):
         tipo = "Receita"
     else:
         tipo = "Compra"
 
-    # 5) categoria (tentativa simples por palavras)
+    # categoria (heurística simples)
     categorias_vocab = [
         "mercado", "supermercado", "farmacia", "combustivel", "gasolina",
         "restaurante", "almoço", "almoco", "taxi", "uber", "aluguel",
@@ -182,17 +194,15 @@ def _parse_freeform(text: str):
             categoria = "Mercado" if kw in ("mercado", "supermercado") else kw.capitalize()
             break
 
-    # 6) descrição = frase original menos data/valor/pagamentos gatilhos
-    # remove /add e vírgulas supérfluas
+    # descrição = original menos termos óbvios
     desc = re.sub(ADD_CMD, "", original, flags=re.IGNORECASE).strip()
-    # remove data/valor ocorrências
-    desc = re.sub(m_data.group(1), "", desc) if m_data else desc
+    if m_data:
+        desc = re.sub(m_data.group(1), "", desc, flags=re.IGNORECASE)
     desc = desc.replace(valor_str, "")
-    # remove palavras comuns de ligação
-    remove_words = ["gastei", "paguei", "com", "no", "na", "do", "da", "de", "para", "pra", "o", "a", "no dia", "dia"]
+
+    remove_words = ["gastei", "paguei", "recebi", "ganhei", "com", "no", "na", "do", "da", "de", "para", "pra", "o", "a", "no dia", "dia"]
     for w in remove_words + list(formas.keys()):
         desc = re.sub(rf"\b{w}\b", "", _strip_accents(desc).lower(), flags=re.IGNORECASE)
-    # volta capitalização simples
     desc = " ".join(tok for tok in desc.replace("  ", " ").strip().split())
     if not desc:
         desc = f"{tipo} {categoria}"
@@ -202,30 +212,25 @@ def _parse_freeform(text: str):
 def parse_add(text):
     """
     Aceita:
-      - "/add DD/MM/AAAA;Tipo;Categoria;Descricao;Valor;Forma"
-      - "/add DD/MM/AAAA Tipo Categoria Descricao Valor Forma"
-      - Frase natural (gastei X no Y com Z dia DD/MM[/AAAA])
-    Retorna lista final no formato: [DataISO, Tipo, Categoria, Descricao, ValorFloat, Forma, Origem]
+      - "/add DD/MM[/AAAA];Tipo;Categoria;Descricao;Valor;Forma"
+      - "/add DD/MM[/AAAA] Tipo Categoria Descricao Valor Forma"
+      - Frase natural (gastei X no Y com Z dia DD/MM[/AAAA] ou 'hoje'/'ontem')
+    Retorna: [DataISO, Tipo, Categoria, Descricao, ValorFloat, Forma, Origem]
     """
     raw = text.strip()
+    payload = ADD_CMD.sub("", raw, count=1).strip() if ADD_CMD.match(raw) else raw
 
-    # tira o prefixo /add (se houver)
-    if ADD_CMD.match(raw):
-        payload = ADD_CMD.sub("", raw, count=1).strip()
-    else:
-        payload = raw
-
-    # 1) tentativas estruturadas
+    # estruturados
     parts = _parse_semicolon(payload) or _parse_space6(payload)
     if parts:
         data_br, tipo, categoria, descricao, valor_str, forma = parts
+        data_br = _normalize_date_br(data_br)
     else:
-        # 2) frase natural
         fr = _parse_freeform(payload)
         if not fr:
-            return None, ("Não entendi. Você pode escrever assim:\n"
-                          "• gastei 45,90 no mercado com cartão, almoço do time dia 07/10/2025\n"
-                          "ou ainda:\n"
+            return None, ("Não entendi. Exemplos:\n"
+                          "• gastei 45,90 no mercado com cartão, almoço do time dia 07/10\n"
+                          "• /add 07/10 compra mercado almoço_do_time 45,90 cartão\n"
                           "• /add 07/10/2025;Compra;Mercado;Almoço do time;45,90;Cartão")
         data_br, tipo, categoria, descricao, valor_str, forma = fr
 
@@ -236,7 +241,7 @@ def parse_add(text):
     except Exception:
         return None, "Data inválida. Use DD/MM/AAAA."
 
-    # Valor (vírgula→ponto)
+    # Valor
     try:
         valor = _to_float_br(valor_str)
     except Exception:
@@ -245,8 +250,7 @@ def parse_add(text):
     origem = "Telegram"
     return [data_iso, tipo.title(), categoria, descricao, valor, forma, origem], None
 
-
-# ===== Envio de mensagens ao Telegram =====
+# ===== Telegram send =====
 async def tg_send(chat_id, text):
     if not TELEGRAM_TOKEN:
         logger.error("TELEGRAM_TOKEN ausente.")
@@ -257,12 +261,10 @@ async def tg_send(chat_id, text):
             json={"chat_id": chat_id, "text": text},
         )
 
-
-# ===== Rotas =====
+# ===== Routes =====
 @app.get("/")
 def root():
     return {"status": "ok"}
-
 
 @app.post("/telegram/webhook")
 async def telegram_webhook(req: Request):
@@ -279,15 +281,15 @@ async def telegram_webhook(req: Request):
             reply = (
                 "Bora lançar seus gastos!\n\n"
                 "Você pode escrever de forma natural, por ex.:\n"
-                "• gastei 45,90 no mercado com cartão, almoço do time dia 07/10/2025\n\n"
+                "• gastei 45,90 no mercado com cartão, almoço do time dia 07/10\n\n"
                 "Ou usar os formatos estruturados:\n"
-                "• /add 07/10/2025 compra mercado almoço_do_time 45,90 cartão\n"
+                "• /add 07/10 compra mercado almoço_do_time 45,90 cartão\n"
                 "• /add 07/10/2025;Compra;Mercado;Almoço do time;45,90;Cartão"
             )
             await tg_send(chat_id, reply)
             return {"ok": True}
 
-        # /add (ou frase contendo 'add')
+        # add via comando ou frase natural
         if ADD_CMD.match(text) or text.lower().startswith(("gastei", "paguei", "recebi", "ganhei")):
             row, err = parse_add(text)
             if err:
@@ -307,7 +309,6 @@ async def telegram_webhook(req: Request):
                 await tg_send(chat_id, f"❌ Erro ao lançar no Excel: {e}")
             return {"ok": True}
 
-        # fallback silencioso
         return {"ok": True}
 
     except Exception:
