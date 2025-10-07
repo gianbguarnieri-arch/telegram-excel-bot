@@ -42,19 +42,31 @@ def msal_token():
 def excel_add_row(values):
     """
     Adiciona uma linha na Tabela do Excel.
-    values deve ser uma lista na ordem exata dos cabeçalhos:
-    [DataISO, Tipo, Categoria, Descricao, ValorFloat, FormaPagamento, Origem]
+    Suporta EXCEL_PATH em dois formatos:
+      1) Caminho por rota:   /users/.../drive/root:/Planilhas/Lancamentos.xlsx
+      2) Caminho por ID:     /users/.../drive/items/01ABC...!123
     """
     token = msal_token()
-    url = (
-        f"{GRAPH_BASE}{EXCEL_PATH}:/workbook/worksheets('{WORKSHEET_NAME}')"
-        f"/tables('{TABLE_NAME}')/rows/add"
-    )
+
+    # Se usar items/{id}, NÃO coloca ':'
+    if "/drive/items/" in EXCEL_PATH:
+        url = (
+            f"{GRAPH_BASE}{EXCEL_PATH}"
+            f"/workbook/worksheets('{WORKSHEET_NAME}')/tables('{TABLE_NAME}')/rows/add"
+        )
+    else:
+        # Caminho por rota usa ':'
+        url = (
+            f"{GRAPH_BASE}{EXCEL_PATH}"
+            f":/workbook/worksheets('{WORKSHEET_NAME}')/tables('{TABLE_NAME}')/rows/add"
+        )
+
     payload = {"values": [values]}
     r = requests.post(url, headers={"Authorization": f"Bearer {token}"}, json=payload, timeout=20)
     if r.status_code >= 300:
         raise RuntimeError(f"Graph error {r.status_code}: {r.text}")
     return r.json()
+
 
 ADD_REGEX = re.compile(r"^/add\s+(.+)$", re.IGNORECASE)
 
