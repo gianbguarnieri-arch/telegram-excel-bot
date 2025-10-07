@@ -165,14 +165,42 @@ def _force_date_ddmmyyyy(s: str) -> str:
 
 def _clean_text_for_freeform(text: str) -> str:
     """
-    Limpa ruídos comuns: remove acentos, retira 'R$', vírgulas/pontos soltos no fim, e normaliza espaços.
+    Limpa ruídos: remove acentos, injeta espaço após 'R$', remove vírgulas/pontos soltos, normaliza espaços.
     """
     t = text.replace("R$", "R$ ").replace("r$", "r$ ")
     t = _strip_accents(t.lower())
-    # remove vírgulas/pontos soltos no fim de tokens (ex.: "cartão," -> "cartao")
-    t = re.sub(r"([a-z0-9]+)[\.,](\s|$)", r"\1\2", t, flags=re.IGNORECASE)
+    t = re.sub(r"([a-z0-9]+)[\.,](\s|$)", r"\1\2", t, flags=re.IGNORECASE)  # "cartão," -> "cartao"
     t = re.sub(r"\s+", " ", t).strip()
     return t
+
+# Mapa simples de palavras-chave → categoria
+CATEGORIA_MAP = {
+    # alimentação / mercado
+    "mercado": "Alimentação", "supermercado": "Alimentação", "padaria": "Alimentação",
+    "restaurante": "Alimentação", "almoco": "Alimentação", "almoço": "Alimentação",
+    # moradia / contas
+    "aluguel": "Moradia", "luz": "Contas", "agua": "Contas", "internet": "Contas",
+    # transporte
+    "combustivel": "Transporte", "gasolina": "Transporte", "uber": "Transporte", "taxi": "Transporte",
+    # saúde
+    "farmacia": "Saúde",
+}
+
+def _guess_categoria(t: str) -> str:
+    for kw, cat in CATEGORIA_MAP.items():
+        if re.search(rf"\b{kw}\b", t):
+            return cat
+    return "Geral"
+
+def _guess_forma(t: str) -> str:
+    if re.search(r"\bpix\b", t): return "Pix"
+    if re.search(r"\bdinheiro\b", t): return "Dinheiro"
+    if re.search(r"\bboleto\b", t): return "Boleto"
+    if re.search(r"\b(transferencia|ted|doc)\b", t): return "Transferência"
+    if re.search(r"\bdebito\b", t): return "Cartão"
+    if re.search(r"\bcredito\b", t): return "Cartão"
+    if re.search(r"\bcartao\b", t): return "Cartão"
+    return "Cartão"
 
 def _parse_freeform(text: str):
     """
@@ -190,47 +218,16 @@ def _parse_freeform(text: str):
     else:
         data_br = datetime.now().strftime("%d/%m/%Y")
 
-    # valor (obrigatório para lançar)
+    # valor (obrigatório p/ lançar)
     m_valor = MONEY_RE.search(t)
     if not m_valor:
-        return None  # sem valor, não dá para lançar
+        return None
     valor_str = m_valor.group(1)
 
-    # forma
-    formas = {
-        "pix": "Pix",
-        "cartao": "Cartão",
-        "credito": "Cartão",
-        "debito": "Cartão",
-        "dinheiro": "Dinheiro",
-        "boleto": "Boleto",
-        "transferencia": "Transferência",
-        "ted": "Transferência",
-        "doc": "Transferência",
-    }
-    forma = "Cartão"
-    for k, v in formas.items():
-        if re.search(rf"\b{k}\b", t):
-            forma = v
-            break
-
-    # tipo
-    if re.search(r"\b(receita|entrada|recebi|venda|ganhei)\b", t):
-        tipo = "Receita"
-    else:
-        tipo = "Compra"
-
-    # categoria (heurística simples)
-    categorias_vocab = [
-        "mercado", "supermercado", "farmacia", "combustivel", "gasolina",
-        "restaurante", "almoco", "taxi", "uber", "aluguel",
-        "luz", "agua", "internet", "padaria"
-    ]
-    categoria = "Geral"
-    for kw in categorias_vocab:
-        if re.search(rf"\b{kw}\b", t):
-            categoria = "Mercado" if kw in ("mercado", "supermercado") else kw.capitalize()
-            break
+    # forma / tipo / categoria
+    forma = _guess_forma(t)
+    tipo = "Receita" if re.search(r"\b(receita|entrada|recebi|venda|ganhei)\b", t) else "Compra"
+    categoria = _guess_categoria(t)
 
     # descrição básica a partir do original, removendo valor e a data encontrada
     desc = re.sub(ADD_CMD, "", original, flags=re.IGNORECASE).strip()
@@ -238,6 +235,35 @@ def _parse_freeform(text: str):
         desc = re.sub(m_data.group(1), "", desc, flags=re.IGNORECASE)
     desc = re.sub(r"R\$\s*", "", desc, flags=re.IGNORECASE)
     desc = desc.replace(m_valor.group(0), "")  # valor com ou sem R$
+    desc = " ".join(desc.split()).strip(" ,.-")
+    if not desc:
+        desc = f"{tipo} {categoria}"
+
+    return [data_br, tipo, categoria, desc, valor_str, forma]
+
+def _fallback_quick_parse(text: str):
+    """
+    Plano B: se o parser natural falhar, tenta extrair o valor e usa defaults.
+    Retorna lista compatível ou None se nem valor achar.
+    """
+    t = _clean_text_for_freeform(text)
+    m_valor = MONEY_RE.search(t)
+    if not m_valor:
+        return None
+
+    valor_str = m_valor.group(1)
+    m_data = DATE_ANY_RE.search(t)
+    data_br = _normalize_date_br(m_data.group(1)) if m_data else datetime.now().strftime("%d/%m/%Y")
+
+    forma = _guess_forma(t)
+    tipo = "Receita" if re.search(r"\b(receita|entrada|recebi|venda|ganhei)\b", t) else "Compra"
+    categoria = _guess_categoria(t)
+
+    desc = re.sub(ADD_CMD, "", text, flags=re.IGNORECASE).strip()
+    if m_data:
+        desc = re.sub(m_data.group(1), "", desc, flags=re.IGNORECASE)
+    desc = re.sub(r"R\$\s*", "", desc, flags=re.IGNORECASE)
+    desc = desc.replace(m_valor.group(0), "")
     desc = " ".join(desc.split()).strip(" ,.-")
     if not desc:
         desc = f"{tipo} {categoria}"
@@ -262,17 +288,17 @@ def parse_add(text: str):
             data_br, tipo, categoria, descricao, valor_str, forma = parts
             data_br = _normalize_date_br(data_br)
         else:
-            fr = _parse_freeform(payload)
+            fr = _parse_freeform(payload) or _fallback_quick_parse(payload)
             if not fr:
                 return None, ("Não entendi. Exemplos:\n"
-                              "• gastei 45,90 no mercado com cartão, almoço do time dia 07/10\n"
+                              "• gastei 45,90 no mercado com cartão hoje\n"
                               "• /add 07/10 compra mercado almoço_do_time 45,90 cartão\n"
                               "• /add 07/10/2025;Compra;Mercado;Almoço do time;45,90;Cartão")
             data_br, tipo, categoria, descricao, valor_str, forma = fr
     else:
-        fr = _parse_freeform(payload)
+        fr = _parse_freeform(payload) or _fallback_quick_parse(payload)
         if not fr:
-            return None, ("Me diga pelo menos um valor, por ex.: 'gastei 45,90 mercado cartão hoje'.")
+            return None, ("Me diga pelo menos um valor, ex.: 'gastei 45,90 mercado cartão hoje'.")
         data_br, tipo, categoria, descricao, valor_str, forma = fr
 
     # força dd/mm/aaaa
@@ -323,42 +349,28 @@ async def telegram_webhook(req: Request):
             return {"ok": True}
 
         if text.lower().startswith("/start"):
-            reply = (
-                "Bora lançar seus gastos!\n\n"
-                "Você pode escrever de forma natural, por ex.:\n"
-                "• gastei 45,90 no mercado com cartão, almoço do time dia 07/10\n\n"
-                "Ou usar os formatos estruturados:\n"
-                "• /add 07/10 compra mercado almoço_do_time 45,90 cartão\n"
-                "• /add 07/10/2025;Compra;Mercado;Almoço do time;45,90;Cartão"
-            )
-            await tg_send(chat_id, reply)
+            await tg_send(chat_id, "Olá! Envie frases como: 'gastei 45,90 no mercado com cartão hoje'.")
             return {"ok": True}
 
-        # ===== Quando devemos tentar interpretar como lançamento? =====
+        # Dispara parser para /add OU qualquer mensagem que pareça ter valor/data
         lower_txt = text.lower()
         has_money = bool(MONEY_RE.search(lower_txt))
-        has_digits = any(ch.isdigit() for ch in lower_txt)
-
-        if ADD_CMD.match(text) or has_money or lower_txt.startswith(("gastei", "paguei", "recebi", "ganhei")) or has_digits:
+        looks_structured_date = bool(re.match(r"^\d{1,2}[\/\.-]\d{1,2}([\/\.-]\d{2,4})?\b", lower_txt))
+        if ADD_CMD.match(text) or has_money or looks_structured_date or any(ch.isdigit() for ch in lower_txt):
             row, err = parse_add(text)
             if err:
                 await tg_send(chat_id, f"❗ {err}")
                 return {"ok": True}
             try:
                 excel_add_row(row)
-                data_iso, tipo, categoria, descricao, valor, forma, _ = row
-                msg_ok = (f"✅ Lançado!\n"
-                          f"{tipo} • {categoria}\n"
-                          f"R$ {valor:.2f} • {forma}\n"
-                          f"{descricao}\n"
-                          f"📅 {data_iso}")
-                await tg_send(chat_id, msg_ok)
+                # Resposta genérica
+                await tg_send(chat_id, "✅ Lançado!")
             except Exception as e:
                 logger.exception("Falha ao escrever no Excel")
                 await tg_send(chat_id, f"❌ Erro ao lançar no Excel: {e}")
             return {"ok": True}
 
-        # Se não for nada disso, ignoramos silenciosamente
+        # Se não for nada disso, ignora silenciosamente
         return {"ok": True}
 
     except Exception:
