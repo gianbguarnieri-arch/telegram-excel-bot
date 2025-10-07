@@ -18,19 +18,19 @@ CLIENT_ID = os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
-# Ex.: /me/drive/root:/Planilhas/Lancamentos.xlsx
-EXCEL_PATH = os.getenv("EXCEL_PATH", "/me/drive/root:/Planilhas/Lancamentos.xlsx")
+# ⚠️ Sem valor padrão para evitar cair em /me/ (delegated)
+EXCEL_PATH = os.getenv("EXCEL_PATH")  # ex.: /users/.../drive/items/FILE_ID  ou  /users/.../drive/root:/Documents/Planilhas/Lancamentos.xlsx
 WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "Plan1")
 TABLE_NAME = os.getenv("TABLE_NAME", "Lancamentos")
 SCOPE = ["https://graph.microsoft.com/.default"]
 
 # ===== Helpers =====
 def msal_token():
-    """Obtem token de app (client credentials) para chamar o Microsoft Graph."""
+    """Obtém token app-only (client credentials) para chamar Microsoft Graph."""
     app_msal = msal.ConfidentialClientApplication(
         client_id=CLIENT_ID,
         client_credential=CLIENT_SECRET,
-        authority=f"https://login.microsoftonline.com/{TENANT_ID}"
+        authority=f"https://login.microsoftonline.com/{TENANT_ID}",
     )
     result = app_msal.acquire_token_silent(SCOPE, account=None)
     if not result:
@@ -43,30 +43,34 @@ def excel_add_row(values):
     """
     Adiciona uma linha na Tabela do Excel.
     Suporta EXCEL_PATH em dois formatos:
-      1) Caminho por rota:   /users/.../drive/root:/Planilhas/Lancamentos.xlsx
+      1) Caminho por rota:   /users/.../drive/root:/Documents/Planilhas/Lancamentos.xlsx
+         → usa  ':/workbook/...'
       2) Caminho por ID:     /users/.../drive/items/01ABC...!123
+         → usa  '/workbook/...'
     """
+    if not EXCEL_PATH:
+        raise RuntimeError("EXCEL_PATH não definido nas variáveis de ambiente.")
+
     token = msal_token()
 
-    # Se usar items/{id}, NÃO coloca ':'
     if "/drive/items/" in EXCEL_PATH:
+        # Formato por ID (NÃO usa ':')
         url = (
             f"{GRAPH_BASE}{EXCEL_PATH}"
             f"/workbook/worksheets('{WORKSHEET_NAME}')/tables('{TABLE_NAME}')/rows/add"
         )
     else:
-        # Caminho por rota usa ':'
+        # Formato por caminho (usa ':')
         url = (
             f"{GRAPH_BASE}{EXCEL_PATH}"
             f":/workbook/worksheets('{WORKSHEET_NAME}')/tables('{TABLE_NAME}')/rows/add"
         )
 
     payload = {"values": [values]}
-    r = requests.post(url, headers={"Authorization": f"Bearer {token}"}, json=payload, timeout=20)
+    r = requests.post(url, headers={"Authorization": f"Bearer {token}"}, json=payload, timeout=25)
     if r.status_code >= 300:
         raise RuntimeError(f"Graph error {r.status_code}: {r.text}")
     return r.json()
-
 
 ADD_REGEX = re.compile(r"^/add\s+(.+)$", re.IGNORECASE)
 
@@ -102,7 +106,7 @@ def parse_add(text):
     return [data_iso, tipo, categoria, descricao, valor, forma, origem], None
 
 async def tg_send(chat_id, text):
-    async with httpx.AsyncClient(timeout=10) as client:
+    async with httpx.AsyncClient(timeout=12) as client:
         await client.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             json={"chat_id": chat_id, "text": text},
@@ -142,7 +146,7 @@ async def telegram_webhook(req: Request):
         excel_add_row(row)
         await tg_send(chat_id, "✅ Lançamento adicionado com sucesso!")
     except Exception as e:
-        # Manda o erro bruto pro chat pra facilitar debug inicial
+        # Retorna o erro bruto para depuração inicial
         await tg_send(chat_id, f"❌ Erro ao lançar no Excel: {e}")
 
     return {"ok": True}
