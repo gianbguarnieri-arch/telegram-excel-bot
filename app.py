@@ -21,8 +21,8 @@ TEMPLATE_FILE_PATH = os.getenv("TEMPLATE_FILE_PATH")  # ex: /users/SEU_UPN/drive
 DEST_FOLDER_ITEM_ID = os.getenv("DEST_FOLDER_ITEM_ID")  # ex: 01HHV...
 
 # Planilha de clientes (onde registramos chat_id e link)
-# Aceitaremos: (a) /users/.../drive/items/<ID> (b) apenas o ID (c) /users/.../drive/root:/path.xlsx
-CLIENTS_TABLE_PATH = os.getenv("CLIENTS_TABLE_PATH")  # ex: /users/SEU_UPN/drive/items/<ID> OU apenas <ID>
+# Aceita: (a) /users/.../drive/items/<ID> (b) apenas o ID (c) /users/.../drive/root:/path.xlsx
+CLIENTS_TABLE_PATH = os.getenv("CLIENTS_TABLE_PATH")  # ex: /users/SEU_UPN/drive/items/<ID do Clientes.xlsx> OU apenas <ID>
 CLIENTS_WORKSHEET_NAME = os.getenv("CLIENTS_WORKSHEET_NAME", "Plan1")
 CLIENTS_TABLE_NAME = os.getenv("CLIENTS_TABLE_NAME", "Clientes")
 
@@ -67,6 +67,7 @@ def normalize_drive_path(raw_path: str) -> str:
     - Se vier só o ID (ex.: "01HHV..."), vira "/users/<upn>/drive/items/<ID>"
     - Se já vier "/users/.../drive/items/<ID>" ou "/users/.../drive/root:...", mantém
     - Remove espaços/quebras de linha invisíveis
+    - Não aceita link http(s)
     """
     if not raw_path:
         raise RuntimeError("CLIENTS_TABLE_PATH não definido.")
@@ -88,21 +89,57 @@ def normalize_drive_path(raw_path: str) -> str:
 
     # Se começar com /drive/... (sem o /users/<upn>), prefixamos com o mesmo UPN do template
     if p.startswith("/drive/"):
-        upn_drive = _users_prefix_from_template().split("/drive")[0]
-        return f"{upn_drive}{p}"
+        upn_prefix = _users_prefix_from_template().split("/drive")[0]
+        return f"{upn_prefix}{p}"
 
-    # Qualquer outro caso: tratamos como caminho relativo sob /drive/root: (ex.: /drive/root:/Planilhas/Clientes.xlsx)
+    # Estilo root:
     upn_drive = _users_prefix_from_template()
     if p.startswith("root:") or p.startswith("/root:") or p.startswith("/drive/root:"):
-        # já é estilo root: — apenas garanta prefixo correto
         suffix = p if p.startswith("/drive/") else f"/{p.lstrip('/')}"
         return f"{upn_drive}{suffix}"
+
     # fallback final: assume arquivo diretamente sob root:
     return f"{upn_drive}/root:/{p.lstrip('/')}"
 
 
 # ============================================
-# Onboarding: copiar modelo e registrar cliente
+# Compartilhamento automático da planilha
+# ============================================
+def create_share_link_anyone_edit(item_id: str):
+    """Tenta criar link 'anonymous edit'. Se 403/bloqueado, tenta 'organization edit'. Se falhar, retorna None."""
+    token = msal_token()
+
+    # 1) tenta 'anonymous' (qualquer pessoa com o link)
+    url = f"{GRAPH_BASE}/me/drive/items/{item_id}/createLink"
+    body = {"type": "edit", "scope": "anonymous"}
+    r = requests.post(url, headers={"Authorization": f"Bearer {token}"}, json=body, timeout=30)
+    if DEBUG:
+        print("DEBUG createLink anonymous status:", r.status_code, r.text[:300])
+
+    if r.status_code < 300:
+        try:
+            return r.json()["link"]["webUrl"]
+        except Exception:
+            pass
+
+    # 2) se não der, tenta 'organization' (usuários logados no seu tenant)
+    body = {"type": "edit", "scope": "organization"}
+    r2 = requests.post(url, headers={"Authorization": f"Bearer {token}"}, json=body, timeout=30)
+    if DEBUG:
+        print("DEBUG createLink organization status:", r2.status_code, r2.text[:300])
+
+    if r2.status_code < 300:
+        try:
+            return r2.json()["link"]["webUrl"]
+        except Exception:
+            pass
+
+    # 3) fallback: sem link de compartilhamento
+    return None
+
+
+# ============================================
+# Onboarding: copiar modelo, compartilhar e registrar cliente
 # ============================================
 def create_client_copy(chat_id, username):
     token = msal_token()
@@ -111,10 +148,8 @@ def create_client_copy(chat_id, username):
     # Monta o endpoint /copy corretamente (por items vs por caminho)
     tfp = (TEMPLATE_FILE_PATH or "").strip()
     if "/drive/items/" in tfp or tfp.startswith("/users/"):
-        # Quando for caminho por items (/users/.../drive/items/<ID>)
         copy_url = f"{GRAPH_BASE}{tfp}/copy" if "/drive/items/" in tfp else f"{GRAPH_BASE}{tfp}:/copy"
     else:
-        # Se por algum motivo vier só um ID no TEMPLATE_FILE_PATH (não recomendado), normaliza
         tfp_norm = normalize_drive_path(tfp)
         copy_url = f"{GRAPH_BASE}{tfp_norm}/copy" if "/drive/items/" in tfp_norm else f"{GRAPH_BASE}{tfp_norm}:/copy"
 
@@ -183,13 +218,17 @@ def create_client_copy(chat_id, username):
     if not new_item_id:
         raise RuntimeError("Não consegui obter o ID do arquivo copiado (tente novamente).")
 
+    # Tenta gerar link de compartilhamento (anonymous -> organization -> fallback)
+    share_url = create_share_link_anyone_edit(new_item_id)
+    final_url = share_url or web_url or "(sem link)"
+
     # Caminho do arquivo copiado em formato /users/.../drive/items/<id>
     excel_path_items = f"{upn_drive}/items/{new_item_id}"
 
     # Registra o cliente na planilha Clientes
-    register_client(chat_id, username, web_url or "(sem link)", excel_path_items)
+    register_client(chat_id, username, final_url, excel_path_items)
 
-    return web_url or "(sem link)"
+    return final_url
 
 
 def register_client(chat_id, username, planilha_url, excel_path_items):
@@ -212,7 +251,7 @@ def register_client(chat_id, username, planilha_url, excel_path_items):
             f"/tables('{CLIENTS_TABLE_NAME}')/rows/add"
         )
 
-    # chat_id | username | planilha_url | excel_path_items | created_at
+    # chat_id | username | planilha_url(compartilhável se possível) | excel_path_items | created_at
     values = [[
         str(chat_id),
         (username or "-"),
@@ -276,8 +315,10 @@ async def telegram_webhook(req: Request):
             web_url = create_client_copy(chat_id, username)
             await tg_send(
                 chat_id,
-                f"✅ Sua planilha foi criada!\n\n📂 Acesse aqui:\n{web_url}\n\n"
-                f"Se precisar, eu compartilho o arquivo pra você."
+                "✅ Sua planilha foi criada!\n\n"
+                "📂 Acesse aqui (compartilhável):\n"
+                f"{web_url}\n\n"
+                "Se precisar, eu compartilho o arquivo pra você."
             )
         except Exception as e:
             await tg_send(chat_id, f"❌ Erro ao criar a planilha: {e}")
