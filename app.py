@@ -88,7 +88,7 @@ def _find_data(texto: str) -> datetime:
             pass
     return hoje
 
-# === 💳 Forma de pagamento aprimorada ===
+# === 💳 Forma de pagamento aprimorada (com banco + emoji) ===
 def _find_forma(texto: str) -> str:
     t = _strip_accents(texto.lower())
 
@@ -100,12 +100,13 @@ def _find_forma(texto: str) -> str:
     if "boleto" in t:
         return "Boleto"
 
-    # Cartão + nome do banco
-    m = re.search(r"cart[aã]o(?:\s+(?:de\s+)?(\w+))?", t)
+    # Cartão + nome (banco/bandeira) após a palavra cartão
+    # Exemplos: "cartão santander", "cartão nubank", "cartão visa"
+    m = re.search(r"cart[aã]o(?:\s+(?:de\s+)?([\w\-]+))?", t)
     if m:
-        banco = m.group(1)
-        if banco:
-            return f"💳 Cartão {banco.capitalize()}"
+        nome = m.group(1)
+        if nome:
+            return f"💳 Cartão {nome.capitalize()}"
         return "💳 Cartão"
 
     # crédito / débito sem citar "cartão"
@@ -116,13 +117,36 @@ def _find_forma(texto: str) -> str:
 
     return "💳 Cartão"
 
+# === Condição de pgto: agora grava "12x" etc. ===
 def _find_condicao(texto: str) -> str:
-    t = _strip_accents(texto.lower()).replace(" ", "")
-    if re.search(r"\b(\d{1,2})x\b", t) or "parcel" in t:
+    t = _strip_accents(texto.lower())
+
+    # 1) "12x" ou "12 x"
+    m = re.search(r"\b(\d{1,2})\s*x\b", t)
+    if m:
+        return f"{int(m.group(1))}x"
+
+    # 2) "12 vezes"
+    m = re.search(r"\b(\d{1,2})\s*vezes\b", t)
+    if m:
+        return f"{int(m.group(1))}x"
+
+    # 3) "parcelado em 12x" / "parcelado em 12 vezes"
+    m = re.search(r"parcel\w*\s*(?:em\s*)?(\d{1,2})\s*x", t)
+    if m:
+        return f"{int(m.group(1))}x"
+    m = re.search(r"parcel\w*\s*(?:em\s*)?(\d{1,2})\s*vezes", t)
+    if m:
+        return f"{int(m.group(1))}x"
+
+    # 4) falou "parcelado" mas sem número → mantém "Parcelado"
+    if "parcel" in t:
         return "Parcelado"
+
+    # 5) padrão: À vista
     return "À vista"
 
-# === Grupos e categorias (mantém tudo igual à última versão) ===
+# === Grupos e categorias ===
 GROUP_FORCE = {
     "🏠": "Gastos Fixos", "gasto fixo": "Gastos Fixos", "fixo": "Gastos Fixos", "fixa": "Gastos Fixos",
     "📺": "Assinatura", "assinatura": "Assinatura", "assinaturas": "Assinatura",
@@ -135,43 +159,57 @@ GROUP_FORCE = {
 }
 
 CATEGORIAS = {
+    # Fixos
     "aluguel": ("Aluguel", "Gastos Fixos"),
     "agua": ("Água", "Gastos Fixos"),
     "energia": ("Energia", "Gastos Fixos"),
     "internet": ("Internet", "Gastos Fixos"),
     "plano de saude": ("Plano de Saúde", "Gastos Fixos"),
     "escola": ("Escola", "Gastos Fixos"),
+
+    # Temporárias
     "financiamento": ("Financiamento", "Despesas Temporárias"),
     "iptu": ("IPTU", "Despesas Temporárias"),
     "ipva": ("IPVA", "Despesas Temporárias"),
     "emprestimo": ("Empréstimo", "Despesas Temporárias"),
+
+    # Assinaturas
     "netflix": ("Netflix", "Assinatura"),
     "amazon": ("Amazon", "Assinatura"),
     "disney": ("Disney+", "Assinatura"),
     "premiere": ("Premiere", "Assinatura"),
     "spotify": ("Spotify", "Assinatura"),
+
+    # Variáveis
     "mercado": ("Mercado", "Gastos Variáveis"),
+    "supermercado": ("Mercado", "Gastos Variáveis"),
     "farmacia": ("Farmácia", "Gastos Variáveis"),
     "combustivel": ("Combustível", "Gastos Variáveis"),
     "gasolina": ("Gasolina", "Gastos Variáveis"),
     "passeio": ("Passeio em família", "Gastos Variáveis"),
     "ifood": ("iFood", "Gastos Variáveis"),
     "viagem": ("Viagem", "Gastos Variáveis"),
+
+    # Ganhos
     "salario": ("Salário", "Ganhos"),
     "vale": ("Vale", "Ganhos"),
     "renda extra 1": ("Renda Extra 1", "Ganhos"),
     "renda extra 2": ("Renda Extra 2", "Ganhos"),
     "pro labore": ("Pró labore", "Ganhos"),
+
+    # Investimentos
     "renda fixa": ("Renda Fixa", "Investimento"),
     "renda variavel": ("Renda Variável", "Investimento"),
     "fundos imobiliarios": ("Fundos imobiliários", "Investimento"),
+
+    # Reserva
     "trocar de carro": ("Trocar de carro", "Reserva"),
     "viagem pra disney": ("Viagem pra Disney", "Reserva"),
 }
 
 FIXO_HINTS = {"mensal", "mensalidade", "assinatura", "plano", "aluguel", "condominio", "luz", "energia", "agua", "internet", "telefone", "iptu", "ipva", "academia", "escola"}
 
-def _force_group_if_asked(texto: str) -> str | None:
+def _force_group_if_asked(texto: str):
     t = _strip_accents(texto.lower())
     for k, g in GROUP_FORCE.items():
         if _strip_accents(k) in t:
@@ -197,7 +235,7 @@ VERBOS_GASTO = {"gastei","paguei","comprei","compra","pago","investi","reservei"
 PAG_PALAVRAS = {"pix","dinheiro","boleto","debito","credito","cartao"}
 TEMPO_PALAVRAS = {"hoje","ontem"}
 
-def _extrair_descricao(original: str, kw_cat: str | None) -> str:
+def _extrair_descricao(original: str, kw_cat):
     txt = _strip_accents(original.lower())
     txt = MONEY_RE.sub(" ", txt)
     txt = re.sub(r"\b\d{1,2}[\/\.-]\d{1,2}(?:[\/\.-](\d{2,4}))?\b", " ", txt)
@@ -252,7 +290,7 @@ async def telegram_webhook(req: Request):
     if not chat_id or not text:
         return {"ok": True}
     if text.lower().startswith("/start"):
-        await tg_send(chat_id, "Envie: 'paguei netflix 39,90 no 💳 cartão santander' ou '💵 recebi salário 3500'.")
+        await tg_send(chat_id, "Ex.: 'compra tv 1200 parcelado em 12x no cartão santander' ou '💵 recebi salário 3500'.")
         return {"ok": True}
     try:
         row, err = interpretar_frase(text)
@@ -260,7 +298,11 @@ async def telegram_webhook(req: Request):
             await tg_send(chat_id, f"❗ {err}")
             return {"ok": True}
         if DEBUG:
-            await tg_send(chat_id, f"[DEBUG]\n{row}")
+            await tg_send(chat_id,
+                "[DEBUG]\n"
+                f"Data: {row[0]}\nTipo: {row[1]}\nGrupo: {row[2]}\nCategoria: {row[3]}\n"
+                f"Descrição: {row[4] or '(vazia)'}\nValor: {row[5]:.2f}\nForma: {row[6]}\nCondição: {row[7]}"
+            )
         excel_add_row(row)
         await tg_send(chat_id, "✅ Lançado!")
     except Exception as e:
