@@ -5,6 +5,9 @@ import requests
 import httpx
 import msal
 
+# =========================
+# Configuração do aplicativo
+# =========================
 app = FastAPI()
 
 # ====== ENVs (alinhadas ao seu Render) ======
@@ -13,21 +16,25 @@ TENANT_ID = os.getenv("TENANT_ID")
 CLIENT_ID = os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 
-# modelo a ser copiado e pasta de destino
+# Modelo a ser copiado e pasta de destino
 TEMPLATE_FILE_PATH = os.getenv("TEMPLATE_FILE_PATH")  # ex: /users/SEU_UPN/drive/items/<ID>
 DEST_FOLDER_ITEM_ID = os.getenv("DEST_FOLDER_ITEM_ID")  # ex: 01HHV...
 
-# planilha de clientes (onde registramos chat_id e link)
+# Planilha de clientes (onde registramos chat_id e link)
 CLIENTS_TABLE_PATH = os.getenv("CLIENTS_TABLE_PATH")  # ex: /users/SEU_UPN/drive/items/<ID do Clientes.xlsx>
 CLIENTS_WORKSHEET_NAME = os.getenv("CLIENTS_WORKSHEET_NAME", "Plan1")
 CLIENTS_TABLE_NAME = os.getenv("CLIENTS_TABLE_NAME", "Clientes")
 
+# Debug opcional
 DEBUG = os.getenv("DEBUG", "0") == "1"
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 SCOPE = ["https://graph.microsoft.com/.default"]
 
-# ===== Auth =====
+
+# =========================
+# Autenticação no Graph
+# =========================
 def msal_token():
     app_msal = msal.ConfidentialClientApplication(
         client_id=CLIENT_ID,
@@ -41,18 +48,25 @@ def msal_token():
         raise RuntimeError(f"MSAL error: {result}")
     return result["access_token"]
 
+
 def _users_prefix_from_template():
-    # se o TEMPLATE_FILE_PATH começa com /users/<upn>/drive, reaproveitamos
+    """
+    Se TEMPLATE_FILE_PATH começa com /users/<upn>/drive, reaproveita esse prefixo;
+    caso contrário, usa /me/drive (fallback).
+    """
     if TEMPLATE_FILE_PATH and TEMPLATE_FILE_PATH.startswith("/users/"):
         return TEMPLATE_FILE_PATH.split("/drive")[0] + "/drive"
     return "/me/drive"
 
-# ===== Onboarding: copiar modelo e registrar cliente =====
+
+# ============================================
+# Onboarding: copiar modelo e registrar cliente
+# ============================================
 def create_client_copy(chat_id, username):
     token = msal_token()
     upn_drive = _users_prefix_from_template()
 
-    # monta o endpoint /copy adequadamente (items vs caminho)
+    # Monta o endpoint /copy corretamente (por items vs por caminho)
     if "/drive/items/" in TEMPLATE_FILE_PATH:
         copy_url = f"{GRAPH_BASE}{TEMPLATE_FILE_PATH}/copy"
     else:
@@ -87,7 +101,7 @@ def create_client_copy(chat_id, username):
     new_item_id = None
     web_url = None
 
-    # polling básico (até ~20s) aguardando a cópia
+    # Polling simples (até ~20s) aguardando a cópia
     if location:
         for _ in range(40):
             rr = requests.get(location, headers={"Authorization": f"Bearer {token}"}, timeout=30)
@@ -101,13 +115,14 @@ def create_client_copy(chat_id, username):
                 if new_item_id:
                     break
             elif rr.status_code in (202, 303):
-                pass  # ainda processando
+                # ainda processando
+                pass
             else:
                 if DEBUG:
                     print("DEBUG polling unexpected:", rr.status_code, rr.text[:400])
                 break
 
-    # fallback: se não veio ID, lista a pasta e encontra pelo nome
+    # Fallback: se não veio ID, lista a pasta de destino e encontra pelo nome
     if not new_item_id:
         children_url = f"{GRAPH_BASE}{upn_drive}/items/{DEST_FOLDER_ITEM_ID}/children"
         rr = requests.get(children_url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
@@ -121,18 +136,19 @@ def create_client_copy(chat_id, username):
     if not new_item_id:
         raise RuntimeError("Não consegui obter o ID do arquivo copiado (tente novamente).")
 
-    # caminho do arquivo copiado em formato /users/.../drive/items/<id>
+    # Caminho do arquivo copiado em formato /users/.../drive/items/<id>
     excel_path_items = f"{upn_drive}/items/{new_item_id}"
 
-    # registra na planilha Clientes
+    # Registra o cliente na planilha Clientes
     register_client(chat_id, username, web_url or "(sem link)", excel_path_items)
 
     return web_url or "(sem link)"
 
+
 def register_client(chat_id, username, planilha_url, excel_path_items):
     token = msal_token()
 
-    # suporte a path por items ou por caminho
+    # Suporte a path por items ou por caminho textual
     if "/drive/items/" in CLIENTS_TABLE_PATH:
         url = (
             f"{GRAPH_BASE}{CLIENTS_TABLE_PATH}"
@@ -146,6 +162,7 @@ def register_client(chat_id, username, planilha_url, excel_path_items):
             f"/tables('{CLIENTS_TABLE_NAME}')/rows/add"
         )
 
+    # chat_id | username | planilha_url | excel_path_items | created_at
     values = [[
         str(chat_id),
         (username or "-"),
@@ -153,6 +170,7 @@ def register_client(chat_id, username, planilha_url, excel_path_items):
         excel_path_items,
         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     ]]
+
     r = requests.post(
         url,
         headers={"Authorization": f"Bearer {token}"},
@@ -166,7 +184,10 @@ def register_client(chat_id, username, planilha_url, excel_path_items):
     if r.status_code >= 300:
         raise RuntimeError(f"Erro ao registrar cliente: {r.text}")
 
-# ===== Telegram =====
+
+# =========================
+# Telegram helpers
+# =========================
 async def tg_send(chat_id, text):
     async with httpx.AsyncClient(timeout=15) as client:
         await client.post(
@@ -174,9 +195,14 @@ async def tg_send(chat_id, text):
             json={"chat_id": chat_id, "text": text},
         )
 
+
+# =========================
+# Rotas
+# =========================
 @app.get("/")
 def root():
     return {"status": "ok"}
+
 
 @app.post("/telegram/webhook")
 async def telegram_webhook(req: Request):
@@ -194,10 +220,14 @@ async def telegram_webhook(req: Request):
         try:
             await tg_send(chat_id, "🕐 Criando sua planilha personalizada, aguarde alguns segundos...")
             web_url = create_client_copy(chat_id, username)
-            await tg_send(chat_id, f"✅ Sua planilha foi criada!\n\n📂 Acesse aqui:\n{web_url}\n\nSe precisar, eu compartilho o arquivo pra você.")
+            await tg_send(
+                chat_id,
+                f"✅ Sua planilha foi criada!\n\n📂 Acesse aqui:\n{web_url}\n\n"
+                f"Se precisar, eu compartilho o arquivo pra você."
+            )
         except Exception as e:
             await tg_send(chat_id, f"❌ Erro ao criar a planilha: {e}")
         return {"ok": True}
 
     await tg_send(chat_id, "Envie /start para gerar sua planilha personalizada.")
-    return {"ok": True"}
+    return {"ok": True}
