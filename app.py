@@ -56,6 +56,7 @@ def excel_add_row(values):
 def _strip_accents(s: str) -> str:
     return "".join(ch for ch in unicodedata.normalize("NFD", s) if unicodedata.category(ch) != "Mn")
 
+# Valor: "R$ 1.234,56" | "1234,56" | "1234.56" | "34"
 MONEY_RE = re.compile(r"(?:r\$\s*)?(\d{1,3}(?:\.\d{3})*(?:,\d{2})?|\d+(?:[.,]\d{2})?)(?!\S)", re.IGNORECASE)
 
 def _find_valor(texto: str):
@@ -71,82 +72,52 @@ def _find_valor(texto: str):
 def _find_data(texto: str) -> datetime:
     t = _strip_accents(texto.lower())
     hoje = datetime.now()
-    if "ontem" in t:
-        return hoje - timedelta(days=1)
-    if "hoje" in t:
-        return hoje
+    if "ontem" in t: return hoje - timedelta(days=1)
+    if "hoje" in t: return hoje
     m = re.search(r"(\d{1,2})[\/\.-](\d{1,2})(?:[\/\.-](\d{2,4}))?", t)
     if m:
         d, mo, y = m.group(1), m.group(2), m.group(3)
-        if not y:
-            y = str(hoje.year)
-        elif len(y) == 2:
-            y = f"20{y}"
+        if not y: y = str(hoje.year)
+        elif len(y) == 2: y = f"20{y}"
         try:
             return datetime.strptime(f"{int(d):02d}/{int(mo):02d}/{int(y):04d}", "%d/%m/%Y")
-        except:
-            pass
+        except: pass
     return hoje
 
-# === 💳 Forma de pagamento aprimorada (com banco + emoji) ===
+# === 💳 Forma de pagamento (com banco/bandeira e emoji) ===
 def _find_forma(texto: str) -> str:
     t = _strip_accents(texto.lower())
-
     # Pix, dinheiro, boleto
-    if "pix" in t:
-        return "Pix"
-    if "dinheiro" in t:
-        return "Dinheiro"
-    if "boleto" in t:
-        return "Boleto"
-
-    # Cartão + nome (banco/bandeira) após a palavra cartão
-    # Exemplos: "cartão santander", "cartão nubank", "cartão visa"
+    if "pix" in t: return "Pix"
+    if "dinheiro" in t: return "Dinheiro"
+    if "boleto" in t: return "Boleto"
+    # Cartão + nome (banco/bandeira)
     m = re.search(r"cart[aã]o(?:\s+(?:de\s+)?([\w\-]+))?", t)
     if m:
         nome = m.group(1)
         if nome:
             return f"💳 Cartão {nome.capitalize()}"
         return "💳 Cartão"
-
-    # crédito / débito sem citar "cartão"
-    if "credito" in t or "crédito" in t:
-        return "💳 Cartão de Crédito"
-    if "debito" in t or "débito" in t:
-        return "💳 Cartão de Débito"
-
+    # crédito / débito sem "cartão"
+    if "credito" in t or "crédito" in t: return "💳 Cartão de Crédito"
+    if "debito" in t or "débito" in t: return "💳 Cartão de Débito"
     return "💳 Cartão"
 
-# === Condição de pgto: agora grava "12x" etc. ===
+# === Condição de pgto: grava "12x" quando houver número de parcelas ===
 def _find_condicao(texto: str) -> str:
     t = _strip_accents(texto.lower())
-
-    # 1) "12x" ou "12 x"
-    m = re.search(r"\b(\d{1,2})\s*x\b", t)
-    if m:
-        return f"{int(m.group(1))}x"
-
-    # 2) "12 vezes"
-    m = re.search(r"\b(\d{1,2})\s*vezes\b", t)
-    if m:
-        return f"{int(m.group(1))}x"
-
-    # 3) "parcelado em 12x" / "parcelado em 12 vezes"
+    m = re.search(r"\b(\d{1,2})\s*x\b", t)          # "12x" ou "12 x"
+    if m: return f"{int(m.group(1))}x"
+    m = re.search(r"\b(\d{1,2})\s*vezes\b", t)      # "12 vezes"
+    if m: return f"{int(m.group(1))}x"
     m = re.search(r"parcel\w*\s*(?:em\s*)?(\d{1,2})\s*x", t)
-    if m:
-        return f"{int(m.group(1))}x"
+    if m: return f"{int(m.group(1))}x"
     m = re.search(r"parcel\w*\s*(?:em\s*)?(\d{1,2})\s*vezes", t)
-    if m:
-        return f"{int(m.group(1))}x"
-
-    # 4) falou "parcelado" mas sem número → mantém "Parcelado"
-    if "parcel" in t:
-        return "Parcelado"
-
-    # 5) padrão: À vista
+    if m: return f"{int(m.group(1))}x"
+    if "parcel" in t: return "Parcelado"            # sem número
     return "À vista"
 
-# === Grupos e categorias ===
+# === GRUPOS & CATEGORIAS ===
 GROUP_FORCE = {
     "🏠": "Gastos Fixos", "gasto fixo": "Gastos Fixos", "fixo": "Gastos Fixos", "fixa": "Gastos Fixos",
     "📺": "Assinatura", "assinatura": "Assinatura", "assinaturas": "Assinatura",
@@ -158,56 +129,137 @@ GROUP_FORCE = {
     "📝": "Reserva", "reserva": "Reserva",
 }
 
+# Grande dicionário de palavras-chave → (Categoria, Grupo)
 CATEGORIAS = {
-    # Fixos
+    # 🏠 Gastos Fixos
     "aluguel": ("Aluguel", "Gastos Fixos"),
-    "agua": ("Água", "Gastos Fixos"),
+    "condominio": ("Condomínio", "Gastos Fixos"),
+    "condomínio": ("Condomínio", "Gastos Fixos"),
     "energia": ("Energia", "Gastos Fixos"),
+    "luz": ("Energia", "Gastos Fixos"),
+    "agua": ("Água", "Gastos Fixos"),
+    "água": ("Água", "Gastos Fixos"),
     "internet": ("Internet", "Gastos Fixos"),
+    "telefone": ("Telefone", "Gastos Fixos"),
     "plano de saude": ("Plano de Saúde", "Gastos Fixos"),
+    "plano de saúde": ("Plano de Saúde", "Gastos Fixos"),
+    "academia": ("Academia", "Gastos Fixos"),
     "escola": ("Escola", "Gastos Fixos"),
+    "faculdade": ("Faculdade", "Gastos Fixos"),
 
-    # Temporárias
-    "financiamento": ("Financiamento", "Despesas Temporárias"),
+    # 🧾 Despesas Temporárias
     "iptu": ("IPTU", "Despesas Temporárias"),
     "ipva": ("IPVA", "Despesas Temporárias"),
+    "financiamento": ("Financiamento", "Despesas Temporárias"),
     "emprestimo": ("Empréstimo", "Despesas Temporárias"),
+    "empréstimo": ("Empréstimo", "Despesas Temporárias"),
 
-    # Assinaturas
+    # 📺 Assinaturas
     "netflix": ("Netflix", "Assinatura"),
-    "amazon": ("Amazon", "Assinatura"),
+    "amazon": ("Amazon Prime", "Assinatura"),
+    "prime video": ("Amazon Prime", "Assinatura"),
     "disney": ("Disney+", "Assinatura"),
+    "disney+": ("Disney+", "Assinatura"),
+    "hbo": ("HBO Max", "Assinatura"),
+    "hbo max": ("HBO Max", "Assinatura"),
     "premiere": ("Premiere", "Assinatura"),
     "spotify": ("Spotify", "Assinatura"),
+    "youtube premium": ("YouTube Premium", "Assinatura"),
 
-    # Variáveis
+    # 💸 Gastos Variáveis — Alimentação
+    "restaurante": ("Restaurante", "Gastos Variáveis"),
+    "lanchonete": ("Lanchonete", "Gastos Variáveis"),
+    "padaria": ("Padaria", "Gastos Variáveis"),
+    "bar": ("Bar", "Gastos Variáveis"),
+    "cafe": ("Café", "Gastos Variáveis"),
+    "café": ("Café", "Gastos Variáveis"),
+    "pizzaria": ("Pizzaria", "Gastos Variáveis"),
+    "pastelaria": ("Pastelaria", "Gastos Variáveis"),
+    "ifood": ("iFood", "Gastos Variáveis"),
+
+    # 💸 Gastos Variáveis — Casa/Compras
     "mercado": ("Mercado", "Gastos Variáveis"),
     "supermercado": ("Mercado", "Gastos Variáveis"),
+    "acougue": ("Açougue", "Gastos Variáveis"),
+    "açougue": ("Açougue", "Gastos Variáveis"),
+    "hortifruti": ("Hortifruti", "Gastos Variáveis"),
+    "feira": ("Feira", "Gastos Variáveis"),
     "farmacia": ("Farmácia", "Gastos Variáveis"),
-    "combustivel": ("Combustível", "Gastos Variáveis"),
-    "gasolina": ("Gasolina", "Gastos Variáveis"),
-    "passeio": ("Passeio em família", "Gastos Variáveis"),
-    "ifood": ("iFood", "Gastos Variáveis"),
-    "viagem": ("Viagem", "Gastos Variáveis"),
+    "farmácia": ("Farmácia", "Gastos Variáveis"),
 
-    # Ganhos
+    # 💸 Gastos Variáveis — Transporte
+    "gasolina": ("Gasolina", "Gastos Variáveis"),
+    "combustivel": ("Combustível", "Gastos Variáveis"),
+    "combustível": ("Combustível", "Gastos Variáveis"),
+    "uber": ("Uber", "Gastos Variáveis"),
+    "99": ("99", "Gastos Variáveis"),
+    "taxi": ("Táxi", "Gastos Variáveis"),
+    "táxi": ("Táxi", "Gastos Variáveis"),
+    "onibus": ("Ônibus", "Gastos Variáveis"),
+    "ônibus": ("Ônibus", "Gastos Variáveis"),
+    "metro": ("Metrô", "Gastos Variáveis"),
+    "metrô": ("Metrô", "Gastos Variáveis"),
+    "estacionamento": ("Estacionamento", "Gastos Variáveis"),
+    "pedagio": ("Pedágio", "Gastos Variáveis"),
+    "pedágio": ("Pedágio", "Gastos Variáveis"),
+
+    # 💸 Gastos Variáveis — Saúde
+    "medico": ("Médico", "Gastos Variáveis"),
+    "médico": ("Médico", "Gastos Variáveis"),
+    "dentista": ("Dentista", "Gastos Variáveis"),
+    "exame": ("Exame", "Gastos Variáveis"),
+    "hospital": ("Hospital", "Gastos Variáveis"),
+    "laboratorio": ("Laboratório", "Gastos Variáveis"),
+    "laboratório": ("Laboratório", "Gastos Variáveis"),
+
+    # 💸 Gastos Variáveis — Lazer/Viagem
+    "passeio": ("Passeio em família", "Gastos Variáveis"),
+    "viagem": ("Viagem", "Gastos Variáveis"),
+    "hotel": ("Hotel", "Gastos Variáveis"),
+    "airbnb": ("Airbnb", "Gastos Variáveis"),
+    "passagem": ("Passagem", "Gastos Variáveis"),
+
+    # 💵 Ganhos
     "salario": ("Salário", "Ganhos"),
+    "salário": ("Salário", "Ganhos"),
     "vale": ("Vale", "Ganhos"),
+    "pro labore": ("Pró labore", "Ganhos"),
+    "pró labore": ("Pró labore", "Ganhos"),
+    "bonus": ("Bônus", "Ganhos"),
+    "bônus": ("Bônus", "Ganhos"),
+    "comissao": ("Comissão", "Ganhos"),
+    "comissão": ("Comissão", "Ganhos"),
+    "renda extra": ("Renda Extra", "Ganhos"),
     "renda extra 1": ("Renda Extra 1", "Ganhos"),
     "renda extra 2": ("Renda Extra 2", "Ganhos"),
-    "pro labore": ("Pró labore", "Ganhos"),
 
-    # Investimentos
+    # 💰 Investimento
     "renda fixa": ("Renda Fixa", "Investimento"),
     "renda variavel": ("Renda Variável", "Investimento"),
+    "renda variável": ("Renda Variável", "Investimento"),
+    "acoes": ("Ações", "Investimento"),
+    "ações": ("Ações", "Investimento"),
+    "bolsa": ("Ações", "Investimento"),
+    "cdb": ("CDB", "Investimento"),
+    "lci": ("LCI", "Investimento"),
+    "lca": ("LCA", "Investimento"),
+    "fii": ("Fundos imobiliários", "Investimento"),
     "fundos imobiliarios": ("Fundos imobiliários", "Investimento"),
+    "fundos imobiliários": ("Fundos imobiliários", "Investimento"),
 
-    # Reserva
+    # 📝 Reserva
     "trocar de carro": ("Trocar de carro", "Reserva"),
     "viagem pra disney": ("Viagem pra Disney", "Reserva"),
+    "emergencia": ("Reserva de Emergência", "Reserva"),
+    "emergência": ("Reserva de Emergência", "Reserva"),
 }
 
-FIXO_HINTS = {"mensal", "mensalidade", "assinatura", "plano", "aluguel", "condominio", "luz", "energia", "agua", "internet", "telefone", "iptu", "ipva", "academia", "escola"}
+FIXO_HINTS = {
+    "mensal", "mensalidade", "assinatura", "plano",
+    "aluguel", "condominio", "condomínio", "luz", "energia",
+    "agua", "água", "internet", "telefone", "iptu", "ipva",
+    "academia", "escola", "faculdade",
+}
 
 def _force_group_if_asked(texto: str):
     t = _strip_accents(texto.lower())
@@ -218,13 +270,17 @@ def _force_group_if_asked(texto: str):
 
 def _guess_categoria_grupo(texto: str):
     t = _strip_accents(texto.lower())
+    # 1) mapeamento direto por palavra-chave
     for kw, (cat, grp) in CATEGORIAS.items():
         if kw in t:
             return cat, grp, kw
-    if any(w in t for w in ["recebi", "ganhei", "entrada", "venda", "salario", "vale"]):
+    # 2) receitas por verbos/termos
+    if any(w in t for w in ["recebi", "ganhei", "entrada", "venda", "salario", "salário", "vale", "bônus", "bonus", "comissao", "comissão"]):
         return "Ganhos", "Ganhos", None
+    # 3) dica de fixo
     if any(h in t for h in FIXO_HINTS):
         return "Outros", "Gastos Fixos", None
+    # 4) fallback: variável
     return "Outros", "Gastos Variáveis", None
 
 def _find_tipo_por_grupo(grupo: str) -> str:
@@ -232,20 +288,20 @@ def _find_tipo_por_grupo(grupo: str) -> str:
 
 STOP_PREPS = {"na","no","em","de","do","da","para","pra","por","via","com","sem","ao","a","o","os","as","um","uma","uns","umas"}
 VERBOS_GASTO = {"gastei","paguei","comprei","compra","pago","investi","reservei","guardei","pague"}
-PAG_PALAVRAS = {"pix","dinheiro","boleto","debito","credito","cartao"}
+PAG_PALAVRAS = {"pix","dinheiro","boleto","debito","credito","cartao","débito","crédito","cartão"}
 TEMPO_PALAVRAS = {"hoje","ontem"}
 
 def _extrair_descricao(original: str, kw_cat):
     txt = _strip_accents(original.lower())
-    txt = MONEY_RE.sub(" ", txt)
-    txt = re.sub(r"\b\d{1,2}[\/\.-]\d{1,2}(?:[\/\.-](\d{2,4}))?\b", " ", txt)
+    txt = MONEY_RE.sub(" ", txt)  # remove valores
+    txt = re.sub(r"\b\d{1,2}[\/\.-]\d{1,2}(?:[\/\.-](\d{2,4}))?\b", " ", txt)  # remove datas
     for w in TEMPO_PALAVRAS | VERBOS_GASTO | PAG_PALAVRAS | STOP_PREPS:
         txt = re.sub(rf"\b{w}\b", " ", txt)
     if kw_cat:
         txt = re.sub(rf"\b{kw_cat}\b", " ", txt)
-    for k in GROUP_FORCE.keys():
+    for k in GROUP_FORCE.keys():  # remove emojis/forçadores de grupo
         txt = re.sub(re.escape(_strip_accents(k)), " ", txt)
-    txt = re.sub(r"\b\d{1,2}x\b", " ", txt)
+    txt = re.sub(r"\b\d{1,2}x\b", " ", txt)  # remove "12x"
     txt = re.sub(r"[^\w\s]", " ", txt)
     txt = re.sub(r"\s+", " ", txt).strip()
     if not txt or (kw_cat and txt == kw_cat):
@@ -259,6 +315,7 @@ def interpretar_frase(texto: str):
         return None, "Não encontrei o valor na mensagem."
     data_dt = _find_data(texto)
     data_iso = data_dt.strftime("%Y-%m-%d")
+
     grupo_forcado = _force_group_if_asked(texto)
     categoria, grupo_sugerido, kw_cat = _guess_categoria_grupo(texto)
     grupo = grupo_forcado or grupo_sugerido
@@ -266,6 +323,7 @@ def interpretar_frase(texto: str):
     forma = _find_forma(texto)
     condicao = _find_condicao(texto)
     descricao = _extrair_descricao(texto, kw_cat)
+
     row = [data_iso, tipo, grupo, categoria, descricao, float(valor), forma, condicao]
     return row, None
 
@@ -287,24 +345,31 @@ async def telegram_webhook(req: Request):
     msg = body.get("message", {})
     chat_id = msg.get("chat", {}).get("id")
     text = (msg.get("text") or "").strip()
+
     if not chat_id or not text:
         return {"ok": True}
+
     if text.lower().startswith("/start"):
-        await tg_send(chat_id, "Ex.: 'compra tv 1200 parcelado em 12x no cartão santander' ou '💵 recebi salário 3500'.")
+        await tg_send(chat_id, "Ex.: 'gastei 104 no restaurante bela italia hoje, via pix' ou '💵 recebi salário 3500'.")
         return {"ok": True}
+
     try:
         row, err = interpretar_frase(text)
         if err:
             await tg_send(chat_id, f"❗ {err}")
             return {"ok": True}
+
         if DEBUG:
             await tg_send(chat_id,
                 "[DEBUG]\n"
-                f"Data: {row[0]}\nTipo: {row[1]}\nGrupo: {row[2]}\nCategoria: {row[3]}\n"
-                f"Descrição: {row[4] or '(vazia)'}\nValor: {row[5]:.2f}\nForma: {row[6]}\nCondição: {row[7]}"
+                f"Data: {row[0]}\nTipo: {row[1]}\nGrupo: {row[2]}\n"
+                f"Categoria: {row[3]}\nDescrição: {row[4] or '(vazia)'}\n"
+                f"Valor: {row[5]:.2f}\nForma: {row[6]}\nCondição: {row[7]}"
             )
+
         excel_add_row(row)
         await tg_send(chat_id, "✅ Lançado!")
     except Exception as e:
         await tg_send(chat_id, f"❌ Erro: {e}")
+
     return {"ok": True}
