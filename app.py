@@ -36,27 +36,108 @@ def msal_token():
     return result["access_token"]
 
 # ===== Funções de integração com Graph =====
+def _users_prefix_from_template():
+    # Se TEMPLATE_FILE_PATH começa com /users/<UPN>/drive, reaproveita esse prefixo.
+    # Caso contrário, usa /me/drive como fallback.
+    if TEMPLATE_FILE_PATH and TEMPLATE_FILE_PATH.startswith("/users/"):
+        return TEMPLATE_FILE_PATH.split("/drive")[0] + "/drive"
+    return "/me/drive"
+
 def create_client_copy(chat_id, username):
     token = msal_token()
-    copy_name = f"Planilha_{username or chat_id}_{datetime.now().strftime('%d%m%Y_%H%M')}.xlsx"
-    copy_url = f"{GRAPH_BASE}{TEMPLATE_FILE_PATH}/copy"
+    upn_drive = _users_prefix_from_template()
+
+    # Monta URL do /copy corretamente (path por items)
+    if "/drive/items/" in TEMPLATE_FILE_PATH:
+        copy_url = f"{GRAPH_BASE}{TEMPLATE_FILE_PATH}/copy"
+    else:
+        copy_url = f"{GRAPH_BASE}{TEMPLATE_FILE_PATH}:/copy"
+
+    # Nome da cópia (sem espaços estranhos)
+    safe_user = (username or str(chat_id)).strip().replace(" ", "_")
+    copy_name = f"Planilha_{safe_user}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
 
     body = {
         "parentReference": {"id": DEST_FOLDER_ITEM_ID},
         "name": copy_name
     }
 
-    r = requests.post(copy_url, headers={"Authorization": f"Bearer {token}"}, json=body)
+    r = requests.post(
+        copy_url,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        json=body,
+        timeout=30
+    )
+    if r.status_code not in (202, 200, 201):
+        raise RuntimeError(f"Erro ao copiar modelo ({r.status_code}): {r.text}")
+
+    # A API geralmente retorna 202 + Location para acompanhar
+    location = r.headers.get("Location")
+    new_item_id = None
+    web_url = None
+
+    # Polling simples (até ~20s) para concluir a cópia
+    if location:
+        for _ in range(40):
+            rr = requests.get(location, headers={"Authorization": f"Bearer {token}"}, timeout=30)
+            if rr.status_code in (200, 201):
+                try:
+                    data = rr.json()
+                except Exception:
+                    data = {}
+                new_item_id = data.get("id") or data.get("resourceId") or data.get("resource", {}).get("id")
+                web_url = (data.get("webUrl") or data.get("resource", {}).get("webUrl"))
+                if new_item_id:
+                    break
+            elif rr.status_code in (202, 303):
+                # ainda processando
+                pass
+            else:
+                break
+
+    # Fallback: se não veio o ID, lista a pasta de destino e acha pelo nome
+    if not new_item_id:
+        children_url = f"{GRAPH_BASE}{upn_drive}/items/{DEST_FOLDER_ITEM_ID}/children"
+        rr = requests.get(children_url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
+        if rr.status_code < 300:
+            for it in rr.json().get("value", []):
+                if it.get("name") == copy_name:
+                    new_item_id = it.get("id")
+                    web_url = it.get("webUrl")
+                    break
+
+    if not new_item_id:
+        raise RuntimeError("Não consegui obter o ID do arquivo copiado (tente novamente).")
+
+    # Monta EXCEL_PATH por items (mais estável)
+    excel_path_items = f"{upn_drive}/items/{new_item_id}"
+
+    # Registra o cliente na planilha de Clientes
+    register_client(chat_id, username, web_url or "(sem link)", excel_path_items)
+
+    return web_url or "(sem link)"
+
+def register_client(chat_id, username, planilha_url, excel_path_items):
+    token = msal_token()
+
+    # Suporta tanto caminho por items quanto por caminho textual
+    if "/drive/items/" in CLIENTS_FILE_PATH:
+        url = f"{GRAPH_BASE}{CLIENTS_FILE_PATH}/workbook/worksheets('{WORKSHEET_NAME}')/tables('{TABLE_NAME}')/rows/add"
+    else:
+        url = f"{GRAPH_BASE}{CLIENTS_FILE_PATH}:/workbook/worksheets('{WORKSHEET_NAME}')/tables('{TABLE_NAME}')/rows/add"
+
+    # Registre: chat_id | username | planilha_url | excel_path_items | created_at
+    values = [[
+        str(chat_id),
+        (username or "-"),
+        planilha_url,
+        excel_path_items,
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ]]
+    r = requests.post(url, headers={"Authorization": f"Bearer {token}"}, json={"values": values}, timeout=30)
     if r.status_code >= 300:
-        raise RuntimeError(f"Erro ao copiar modelo: {r.text}")
+        raise RuntimeError(f"Erro ao registrar cliente: {r.text}")
 
-    # Pega o link da cópia criada
-    new_file = r.json()
-    web_url = new_file.get("webUrl", "Link não disponível")
-
-    # Registra o cliente na planilha
-    register_client(chat_id, username, web_url)
-    return web_url
 
 def register_client(chat_id, username, planilha_url):
     token = msal_token()
