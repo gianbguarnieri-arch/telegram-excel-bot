@@ -21,7 +21,8 @@ TEMPLATE_FILE_PATH = os.getenv("TEMPLATE_FILE_PATH")  # ex: /users/SEU_UPN/drive
 DEST_FOLDER_ITEM_ID = os.getenv("DEST_FOLDER_ITEM_ID")  # ex: 01HHV...
 
 # Planilha de clientes (onde registramos chat_id e link)
-CLIENTS_TABLE_PATH = os.getenv("CLIENTS_TABLE_PATH")  # ex: /users/SEU_UPN/drive/items/<ID do Clientes.xlsx>
+# Aceitaremos: (a) /users/.../drive/items/<ID> (b) apenas o ID (c) /users/.../drive/root:/path.xlsx
+CLIENTS_TABLE_PATH = os.getenv("CLIENTS_TABLE_PATH")  # ex: /users/SEU_UPN/drive/items/<ID> OU apenas <ID>
 CLIENTS_WORKSHEET_NAME = os.getenv("CLIENTS_WORKSHEET_NAME", "Plan1")
 CLIENTS_TABLE_NAME = os.getenv("CLIENTS_TABLE_NAME", "Clientes")
 
@@ -54,9 +55,50 @@ def _users_prefix_from_template():
     Se TEMPLATE_FILE_PATH começa com /users/<upn>/drive, reaproveita esse prefixo;
     caso contrário, usa /me/drive (fallback).
     """
-    if TEMPLATE_FILE_PATH and TEMPLATE_FILE_PATH.startswith("/users/"):
-        return TEMPLATE_FILE_PATH.split("/drive")[0] + "/drive"
+    tfp = (TEMPLATE_FILE_PATH or "").strip()
+    if tfp.startswith("/users/"):
+        return tfp.split("/drive")[0] + "/drive"
     return "/me/drive"
+
+
+def normalize_drive_path(raw_path: str) -> str:
+    """
+    Normaliza CLIENTS_TABLE_PATH (ou outros caminhos) para um formato aceito:
+    - Se vier só o ID (ex.: "01HHV..."), vira "/users/<upn>/drive/items/<ID>"
+    - Se já vier "/users/.../drive/items/<ID>" ou "/users/.../drive/root:...", mantém
+    - Remove espaços/quebras de linha invisíveis
+    """
+    if not raw_path:
+        raise RuntimeError("CLIENTS_TABLE_PATH não definido.")
+
+    p = raw_path.strip()
+
+    # Não pode ser URL http(s) aqui
+    if p.lower().startswith("http"):
+        raise RuntimeError("CLIENTS_TABLE_PATH não deve ser um link http(s). Use items ID ou caminho do Graph (/users/...).")
+
+    # Já está no formato /users/.../drive/...
+    if p.startswith("/users/"):
+        return p
+
+    # Se o valor é um ID de item (muito comum começar com '01')
+    if p.startswith("01"):
+        upn_drive = _users_prefix_from_template()
+        return f"{upn_drive}/items/{p}"
+
+    # Se começar com /drive/... (sem o /users/<upn>), prefixamos com o mesmo UPN do template
+    if p.startswith("/drive/"):
+        upn_drive = _users_prefix_from_template().split("/drive")[0]
+        return f"{upn_drive}{p}"
+
+    # Qualquer outro caso: tratamos como caminho relativo sob /drive/root: (ex.: /drive/root:/Planilhas/Clientes.xlsx)
+    upn_drive = _users_prefix_from_template()
+    if p.startswith("root:") or p.startswith("/root:") or p.startswith("/drive/root:"):
+        # já é estilo root: — apenas garanta prefixo correto
+        suffix = p if p.startswith("/drive/") else f"/{p.lstrip('/')}"
+        return f"{upn_drive}{suffix}"
+    # fallback final: assume arquivo diretamente sob root:
+    return f"{upn_drive}/root:/{p.lstrip('/')}"
 
 
 # ============================================
@@ -67,10 +109,14 @@ def create_client_copy(chat_id, username):
     upn_drive = _users_prefix_from_template()
 
     # Monta o endpoint /copy corretamente (por items vs por caminho)
-    if "/drive/items/" in TEMPLATE_FILE_PATH:
-        copy_url = f"{GRAPH_BASE}{TEMPLATE_FILE_PATH}/copy"
+    tfp = (TEMPLATE_FILE_PATH or "").strip()
+    if "/drive/items/" in tfp or tfp.startswith("/users/"):
+        # Quando for caminho por items (/users/.../drive/items/<ID>)
+        copy_url = f"{GRAPH_BASE}{tfp}/copy" if "/drive/items/" in tfp else f"{GRAPH_BASE}{tfp}:/copy"
     else:
-        copy_url = f"{GRAPH_BASE}{TEMPLATE_FILE_PATH}:/copy"
+        # Se por algum motivo vier só um ID no TEMPLATE_FILE_PATH (não recomendado), normaliza
+        tfp_norm = normalize_drive_path(tfp)
+        copy_url = f"{GRAPH_BASE}{tfp_norm}/copy" if "/drive/items/" in tfp_norm else f"{GRAPH_BASE}{tfp_norm}:/copy"
 
     safe_user = (username or str(chat_id)).strip().replace(" ", "_")
     copy_name = f"Planilha_{safe_user}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
@@ -91,6 +137,7 @@ def create_client_copy(chat_id, username):
     )
 
     if DEBUG:
+        print("DEBUG /copy URL:", copy_url)
         print("DEBUG /copy status:", r.status_code, r.text[:400])
 
     if r.status_code not in (202, 200, 201):
@@ -148,16 +195,19 @@ def create_client_copy(chat_id, username):
 def register_client(chat_id, username, planilha_url, excel_path_items):
     token = msal_token()
 
-    # Suporte a path por items ou por caminho textual
-    if "/drive/items/" in CLIENTS_TABLE_PATH:
+    # Normaliza o caminho informado na ENV (aceita só ID, items, root: etc.)
+    clients_path = normalize_drive_path(CLIENTS_TABLE_PATH)
+
+    # Suporte a path por items (/drive/items/<ID>) ou por caminho (:/workbook)
+    if "/drive/items/" in clients_path:
         url = (
-            f"{GRAPH_BASE}{CLIENTS_TABLE_PATH}"
+            f"{GRAPH_BASE}{clients_path}"
             f"/workbook/worksheets('{CLIENTS_WORKSHEET_NAME}')"
             f"/tables('{CLIENTS_TABLE_NAME}')/rows/add"
         )
     else:
         url = (
-            f"{GRAPH_BASE}{CLIENTS_TABLE_PATH}"
+            f"{GRAPH_BASE}{clients_path}"
             f":/workbook/worksheets('{CLIENTS_WORKSHEET_NAME}')"
             f"/tables('{CLIENTS_TABLE_NAME}')/rows/add"
         )
@@ -170,6 +220,10 @@ def register_client(chat_id, username, planilha_url, excel_path_items):
         excel_path_items,
         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     ]]
+
+    if DEBUG:
+        print("DEBUG register URL:", url)
+        print("DEBUG register VALUES:", values)
 
     r = requests.post(
         url,
