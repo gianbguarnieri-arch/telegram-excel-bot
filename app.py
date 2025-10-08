@@ -66,12 +66,46 @@ def g_get(url: str, token: str):
     return r
 
 # ----------------------------
+# Utils
+# ----------------------------
+def safe_sleep_from_retry_after(resp, default_seconds=2):
+    ra = resp.headers.get("Retry-After")
+    try:
+        wait = int(ra) if ra is not None else default_seconds
+    except ValueError:
+        wait = default_seconds
+    time.sleep(max(wait, 1))
+
+def list_child_by_name(dest_folder_id: str, name: str, token: str):
+    """
+    Procura por um item com determinado 'name' dentro de uma pasta (por ID).
+    Retorna o JSON do item se achar, senão None.
+    """
+    url = (
+        f"{GRAPH_BASE}/drive/items/{dest_folder_id}/children"
+        f"?$select=id,name,lastModifiedDateTime&$top=200"
+    )
+    while True:
+        r = g_get(url, token)
+        data = r.json()
+        for it in data.get("value", []):
+            if it.get("name") == name:
+                return it
+        # paginação
+        next_link = data.get("@odata.nextLink")
+        if not next_link:
+            break
+        url = next_link
+    return None
+
+# ----------------------------
 # OneDrive/SharePoint: copiar modelo e criar link público
 # ----------------------------
 def copy_template_for_client(client_name: str) -> dict:
     """
     Copia o arquivo modelo para a pasta DEST_FOLDER_ITEM_ID com um nome
     amigável e retorna o JSON do item recém-criado (inclui 'id').
+    Também implementa polling robusto + fallback por listagem.
     """
     if not TEMPLATE_FILE_PATH or not DEST_FOLDER_ITEM_ID:
         raise RuntimeError("TEMPLATE_FILE_PATH ou DEST_FOLDER_ITEM_ID não definidos.")
@@ -84,7 +118,6 @@ def copy_template_for_client(client_name: str) -> dict:
     new_name = f"Planilha_{safe_name}_{stamp}.xlsx"
 
     # POST /drive/items/{item-id}/copy
-    # Observação: TEMPLATE_FILE_PATH está no formato /users/.../drive/items/{ID}
     copy_url = f"{GRAPH_BASE}{TEMPLATE_FILE_PATH}/copy"
     body = {
         "parentReference": {"id": DEST_FOLDER_ITEM_ID},
@@ -92,35 +125,66 @@ def copy_template_for_client(client_name: str) -> dict:
     }
     resp = g_post(copy_url, token, data=body)
 
-    if resp.status_code not in (202,):  # Accepted
-        raise RuntimeError(f"Erro ao copiar modelo: {resp.text}")
+    # A API costuma devolver 202 + Location para monitorar
+    if resp.status_code == 202:
+        monitor = resp.headers.get("Location")
+        if DEBUG:
+            print("Copy accepted. Monitor:", monitor)
 
-    # Polling do monitor até concluir
-    monitor = resp.headers.get("Location")
-    if not monitor:
-        # fallback: às vezes a API retorna de imediato o item no body (raro)
-        try:
-            return resp.json()
-        except Exception:
-            raise RuntimeError("Copia iniciada, mas sem Location para monitorar.")
+        # Polling por até ~5 minutos
+        total_wait = 0
+        max_wait = 300  # 5min
 
-    # Aguarda concluir
-    for _ in range(40):  # ~40 * 1s = 40s
-        time.sleep(1)
-        r2 = requests.get(monitor, headers=g_headers(token))
-        if r2.status_code == 202:
-            # ainda processando
-            continue
-        if r2.status_code in (200, 201):
-            try:
-                item = r2.json()
-                return item
-            except Exception:
+        if monitor:
+            while total_wait < max_wait:
+                r2 = requests.get(monitor, headers=g_headers(token))
+                if r2.status_code == 202:
+                    if DEBUG:
+                        print("Still copying... 202")
+                    safe_sleep_from_retry_after(r2, default_seconds=3)
+                    total_wait += 3
+                    continue
+
+                if r2.status_code in (200, 201):
+                    # Concluiu com payload do item
+                    try:
+                        item = r2.json()
+                        if DEBUG:
+                            print("Copy finished with payload.")
+                        return item
+                    except Exception:
+                        # Se der erro para json, tenta fallback
+                        if DEBUG:
+                            print("Copy finished but invalid payload; fallback to listing.")
+                        break
+
+                # Qualquer outro status: tenta fallback
+                if DEBUG:
+                    print("Monitor returned", r2.status_code, "— fallback to listing.")
                 break
-        # qualquer outra situação
-        break
 
-    raise RuntimeError("Timeout ao copiar o modelo (monitor).")
+        # Fallback: procurar pelo nome na pasta de destino
+        if DEBUG:
+            print("Fallback: listing children to find", new_name)
+        for _ in range(40):  # tenta por ~40*3=120s, caso a visibilidade demore
+            item = list_child_by_name(DEST_FOLDER_ITEM_ID, new_name, token)
+            if item:
+                if DEBUG:
+                    print("Found copied item by listing:", item.get("id"))
+                return item
+            time.sleep(3)
+
+        raise RuntimeError("Timeout ao copiar o modelo (monitor + fallback).")
+
+    # Em alguns casos raros a API devolve 200/201 com o item direto
+    try:
+        item = resp.json()
+        if "id" in item:
+            return item
+    except Exception:
+        pass
+
+    raise RuntimeError(f"Erro inesperado na cópia: {resp.status_code} {resp.text}")
 
 def create_anonymous_link(item_id: str, link_type: str = "view") -> str:
     """
@@ -167,20 +231,15 @@ async def telegram_webhook(req: Request):
     if not chat_id or not text:
         return {"ok": True}
 
-    # /start -> cria a planilha do cliente e envia link público
     if text.lower().startswith("/start"):
-        # Tenta usar o primeiro nome como "nome do cliente" se existir
         first_name = message.get("from", {}).get("first_name") or "Cliente"
         try:
-            # 1) Copia o modelo para a pasta destino
             new_item = copy_template_for_client(first_name)
             new_id = new_item.get("id")
             if not new_id:
                 raise RuntimeError(f"Não obtive ID do novo arquivo: {json.dumps(new_item)}")
 
-            # 2) Cria link público (qualquer pessoa com o link)
-            #    Use 'edit' se quiser permitir edição
-            public_link = create_anonymous_link(new_id, link_type="edit")
+            public_link = create_anonymous_link(new_id, link_type="edit")  # mude para 'view' se quiser só leitura
 
             await tg_send(
                 chat_id,
@@ -191,7 +250,6 @@ async def telegram_webhook(req: Request):
             await tg_send(chat_id, f"❌ Erro ao criar a planilha: {e}")
         return {"ok": True}
 
-    # mensagem padrão
     await tg_send(
         chat_id,
         "Olá! Envie /start para eu criar sua planilha e te mandar o link público."
