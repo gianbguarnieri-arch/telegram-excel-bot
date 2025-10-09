@@ -102,58 +102,83 @@ def excel_list_rows(item_path: str, worksheet: str, table: str, top: int = 500) 
     return rows
 
 # -----------------------------------------------------------
-# Cópia do modelo para criar planilha do cliente
+# Cópia do modelo para criar planilha do cliente (com fallback)
 # -----------------------------------------------------------
 def copy_template_for_user(file_name: str) -> Dict[str, Any]:
     """
     POST /drives/{DRIVE_ID}/items/{TEMPLATE_ITEM_ID}/copy  ->  202 + Location
     Faz poll no Location, retorna metadata do novo item.
+    Tenta primeiro parentReference {id}; se der 400, tenta {driveId, id}.
     """
     if not (DRIVE_ID and TEMPLATE_ITEM_ID and DEST_FOLDER_ITEM_ID):
         raise RuntimeError("Faltam DRIVE_ID/TEMPLATE_ITEM_ID/DEST_FOLDER_ITEM_ID.")
 
     copy_url = f"{GRAPH_BASE}/drives/{DRIVE_ID}/items/{TEMPLATE_ITEM_ID}/copy"
-    body = {
+
+    def _do_copy(body: dict) -> Dict[str, Any]:
+        r = gpost(copy_url, json=body, extra_headers={"Prefer": "respond-async"})
+        if r.status_code not in (202, 201, 200):
+            raise RuntimeError(f"Graph POST {r.status_code}: {r.text}")
+
+        # Alguns tenants retornam já o item no corpo
+        if r.status_code in (200, 201):
+            try:
+                data = r.json()
+                if "id" in data:
+                    return data
+            except Exception:
+                pass
+
+        location = r.headers.get("Location") or r.headers.get("location")
+        if not location:
+            # Se não veio Location, tentar ler eventuais dados no corpo
+            try:
+                data = r.json()
+                if "id" in data:
+                    return data
+            except Exception:
+                pass
+            raise RuntimeError("Cópia sem Location (monitor).")
+
+        # Poll do monitor
+        for _ in range(30):  # ~60s
+            time.sleep(2)
+            rr = requests.get(location, headers=headers(), timeout=30)
+            if rr.status_code in (200, 201):
+                try:
+                    data = rr.json()
+                except Exception:
+                    data = {}
+                # Alguns monitores retornam resourceId
+                if "resourceId" in data:
+                    new_id = data["resourceId"]
+                    meta = gget(f"{GRAPH_BASE}/drives/{DRIVE_ID}/items/{new_id}")
+                    return meta.json() if meta.status_code == 200 else {"id": new_id}
+                if "id" in data:
+                    return data
+                return data
+            if rr.status_code >= 400:
+                raise RuntimeError(f"Monitor error {rr.status_code}: {rr.text}")
+        raise RuntimeError("Timeout no monitor da cópia.")
+
+    # 1) Tentativa principal: parentReference só com id (mais aceito no SharePoint)
+    body_primary = {
         "name": file_name,
-        "parentReference": {"driveId": DRIVE_ID, "id": DEST_FOLDER_ITEM_ID},
+        "parentReference": {"id": DEST_FOLDER_ITEM_ID},
         "conflictBehavior": "rename",
     }
-    r = gpost(copy_url, json=body, extra_headers={"Prefer": "respond-async"})
-    if r.status_code not in (202, 201, 200):
-        raise RuntimeError(f"Graph POST {r.status_code}: {r.text}")
-
-    location = r.headers.get("Location") or r.headers.get("location")
-    if not location:
-        # às vezes já retorna o item no body
-        try:
-            data = r.json()
-            if "id" in data:
-                return data
-        except Exception:
-            pass
-        raise RuntimeError("Cópia sem Location (monitor).")
-
-    # poll
-    for _ in range(30):  # até ~60s
-        time.sleep(2)
-        rr = requests.get(location, headers=headers(), timeout=30)
-        if rr.status_code in (200, 201):
-            try:
-                data = rr.json()
-            except Exception:
-                data = {}
-            # se vier resourceId
-            if "resourceId" in data:
-                new_id = data["resourceId"]
-                meta = gget(f"{GRAPH_BASE}/drives/{DRIVE_ID}/items/{new_id}")
-                return meta.json() if meta.status_code == 200 else {"id": new_id}
-            # ou já veio id/webUrl
-            if "id" in data:
-                return data
-            return data
-        if rr.status_code >= 400:
-            raise RuntimeError(f"Monitor error {rr.status_code}: {rr.text}")
-    raise RuntimeError("Timeout no monitor da cópia.")
+    try:
+        return _do_copy(body_primary)
+    except Exception as e1:
+        if DEBUG:
+            print("copy primary failed:", e1)
+        # 2) Fallback: usar {driveId, id}
+        body_fallback = {
+            "name": file_name,
+            "parentReference": {"driveId": DRIVE_ID, "id": DEST_FOLDER_ITEM_ID},
+            "conflictBehavior": "rename",
+        }
+        return _do_copy(body_fallback)
 
 # -----------------------------------------------------------
 # Planilha de Clientes: upsert e lookup
@@ -315,7 +340,7 @@ def parse_free_text(text: str) -> Tuple[List[Any], Optional[str]]:
     condicao = "À vista" if tipo == "Saída" else ""
     parc = m.group("parcelas")
     if parc:
-        condicao = parc  # 12x
+        condicao = parc  # ex.: 12x
 
     desc = text.strip()
     grupo, categoria = guess_group_and_category(desc)
