@@ -1,403 +1,429 @@
+# app.py
 import os
 import re
+import json
 import time
-from datetime import datetime, timedelta
-from typing import Dict, Any, Optional, Tuple, List
+import asyncio
+from datetime import datetime, date
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
-import msal
-import requests
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
-# -----------------------------------------------------------
+# ---------------------------------------------------------------------
 # Config
-# -----------------------------------------------------------
-app = FastAPI()
+# ---------------------------------------------------------------------
+TENANT_ID = os.getenv("TENANT_ID", "").strip()
+CLIENT_ID = os.getenv("CLIENT_ID", "").strip()
+CLIENT_SECRET = os.getenv("CLIENT_SECRET", "").strip()
 
-# Telegram
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+DRIVE_ID = os.getenv("DRIVE_ID", "").strip()
+TEMPLATE_ITEM_ID = os.getenv("TEMPLATE_ITEM_ID", "").strip()
+DEST_FOLDER_ITEM_ID = os.getenv("DEST_FOLDER_ITEM_ID", "").strip()
 
-# Graph / Auth
-TENANT_ID = os.getenv("TENANT_ID")
-CLIENT_ID = os.getenv("CLIENT_ID")
-CLIENT_SECRET = os.getenv("CLIENT_SECRET")
-SCOPE = ["https://graph.microsoft.com/.default"]
+CLIENTS_TABLE_PATH = os.getenv("CLIENTS_TABLE_PATH", "").strip()
+CLIENTS_TABLE_NAME = os.getenv("CLIENTS_TABLE_NAME", "Clientes").strip()
+CLIENTS_WORKSHEET_NAME = os.getenv("CLIENTS_WORKSHEET_NAME", "Plan1").strip()
+
+TABLE_NAME = os.getenv("TABLE_NAME", "Lancamentos").strip()
+WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "Plan1").strip()
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+DEBUG = os.getenv("DEBUG", "0").strip() in ("1", "true", "True", "yes")
+
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
-# Template e destino (SharePoint do site)
-DRIVE_ID = os.getenv("DRIVE_ID", "").strip()
-TEMPLATE_ITEM_ID = os.getenv("TEMPLATE_ITEM_ID", "").strip()          # modelo Lancamentos.xlsx (ID do arquivo no site)
-DEST_FOLDER_ITEM_ID = os.getenv("DEST_FOLDER_ITEM_ID", "").strip()    # pasta Planilhas (ID da pasta no site)
+app = FastAPI(title="telegram-excel-bot", version="2.0")
 
-# Planilha de Clientes (onde registramos o chat_id -> excel_path)
-# Formato: /drives/{driveId}/items/{itemId}
-CLIENTS_TABLE_PATH = os.getenv("CLIENTS_TABLE_PATH", "").strip()
-CLIENTS_WORKSHEET_NAME = os.getenv("CLIENTS_WORKSHEET_NAME", "Plan1")
-CLIENTS_TABLE_NAME = os.getenv("CLIENTS_TABLE_NAME", "Clientes")
 
-# Padrões da planilha de lançamentos do cliente
-DEFAULT_WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "Plan1")
-DEFAULT_TABLE_NAME = os.getenv("TABLE_NAME", "Lancamentos")  # defina no Render exatamente como está na Tabela
-
-DEBUG = os.getenv("DEBUG", "0") == "1"
-
-# -----------------------------------------------------------
-# Auth & HTTP helpers
-# -----------------------------------------------------------
-def msal_token() -> str:
-    app_msal = msal.ConfidentialClientApplication(
-        client_id=CLIENT_ID,
-        client_credential=CLIENT_SECRET,
-        authority=f"https://login.microsoftonline.com/{TENANT_ID}",
-    )
-    result = app_msal.acquire_token_silent(SCOPE, account=None)
-    if not result:
-        result = app_msal.acquire_token_for_client(scopes=SCOPE)
-    if "access_token" not in result:
-        raise RuntimeError(f"MSAL error: {result}")
-    return result["access_token"]
-
-def headers() -> Dict[str, str]:
-    return {"Authorization": f"Bearer {msal_token()}", "Content-Type": "application/json"}
-
-def gget(url: str, **kw) -> requests.Response:
+def log(*args):
     if DEBUG:
-        print("GET", url)
-    return requests.get(url, headers=headers(), timeout=30, **kw)
+        print("[DEBUG]", *args)
 
-def gpost(url: str, json: Optional[dict] = None, extra_headers: Optional[dict] = None) -> requests.Response:
-    h = headers()
-    if extra_headers:
-        h.update(extra_headers)
-    if DEBUG:
-        print("POST", url, "json=", json)
-    return requests.post(url, headers=h, json=json, timeout=30)
 
-# -----------------------------------------------------------
-# Excel helpers (tabelas)
-# -----------------------------------------------------------
-def excel_add_row_by_item_path(item_path: str, worksheet: str, table: str, values: list) -> dict:
+# ---------------------------------------------------------------------
+# Auth (corrige invalidAudienceUri)
+# ---------------------------------------------------------------------
+_access_token_cache: Tuple[float, str] = (0.0, "")
+
+async def get_access_token() -> str:
     """
-    item_path: '/drives/{driveId}/items/{itemId}'  (SEM '/workbook' e SEM ':')
+    Client Credentials com scope '.default' (corrige invalidAudienceUri).
     """
-    if not item_path:
-        raise RuntimeError("Caminho do Excel não definido (item_path vazio).")
+    global _access_token_cache
+    now = time.time()
+    exp, token = _access_token_cache
+    if token and now < exp:
+        return token
 
-    url = f"{GRAPH_BASE}{item_path}/workbook/worksheets('{worksheet}')/tables('{table}')/rows/add"
-    payload = {"values": [values]}
-    r = gpost(url, json=payload)
-    if r.status_code >= 300:
-        raise RuntimeError(f"Graph error {r.status_code}: {r.text}")
+    url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
+    data = {
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "grant_type": "client_credentials",
+        "scope": "https://graph.microsoft.com/.default",
+    }
+    async with httpx.AsyncClient(timeout=40) as cli:
+        r = await cli.post(url, data=data)
+    if r.status_code != 200:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Token error {r.status_code}: {r.text}"
+        )
+    tok = r.json()
+    access_token = tok["access_token"]
+    expires_in = int(tok.get("expires_in", 3599))
+    _access_token_cache = (now + expires_in - 60, access_token)
+    return access_token
+
+
+async def graph(method: str, path: str, **kwargs) -> httpx.Response:
+    """
+    Chamada Graph com Bearer; path deve ser relativo a /v1.0 (ex.: '/drives/{id}/items/...').
+    """
+    token = await get_access_token()
+    url = f"{GRAPH_BASE}{path}"
+    headers = kwargs.pop("headers", {})
+    headers["Authorization"] = f"Bearer {token}"
+    headers.setdefault("Content-Type", "application/json")
+    async with httpx.AsyncClient(timeout=60) as cli:
+        resp = await cli.request(method, url, headers=headers, **kwargs)
+    return resp
+
+
+# ---------------------------------------------------------------------
+# Utilitários Graph / Excel
+# ---------------------------------------------------------------------
+def extract_item_root_from_clients_path() -> str:
+    """
+    De CLIENTS_TABLE_PATH (que aponta para workbook, p.ex. '/drives/{driveId}/items/{itemId}')
+    devolve o prefixo '/drives/.../items/{itemId}' sem o sufixo '/workbook...'
+    para lermos metadata do arquivo.
+    """
+    p = CLIENTS_TABLE_PATH.strip()
+    # comum: '/users/.../drive/items/{id}' ou '/drives/{driveId}/items/{id}'
+    # se já terminar com '/items/{id}', devolve; se tiver '/workbook', corta antes.
+    if "/workbook" in p:
+        p = p.split("/workbook")[0]
+    return p
+
+
+async def graph_get_json(path: str) -> Dict[str, Any]:
+    r = await graph("GET", path)
+    if r.status_code >= 400:
+        raise HTTPException(status_code=r.status_code, detail=r.text)
     return r.json()
 
-def excel_list_rows(item_path: str, worksheet: str, table: str, top: int = 2000) -> List[List[Any]]:
-    url = f"{GRAPH_BASE}{item_path}/workbook/worksheets('{worksheet}')/tables('{table}')/rows?$top={top}"
-    r = gget(url)
-    if r.status_code >= 300:
-        raise RuntimeError(f"Graph list rows {r.status_code}: {r.text}")
-    data = r.json()
-    rows = []
-    for it in data.get("value", []):
-        rows.append(it.get("values", [[]])[0])
-    return rows
 
-# -----------------------------------------------------------
-# Cópia do modelo para criar planilha do cliente (com 409 handling + fallback)
-# -----------------------------------------------------------
-def copy_template_for_user(file_name: str) -> Dict[str, Any]:
+async def ensure_clients_sheet_ok() -> Dict[str, Any]:
     """
-    Copia TEMPLATE_ITEM_ID -> DEST_FOLDER_ITEM_ID (no drive do site).
-    - Primeiro tenta parentReference {"id": ...}
-    - Se 400, tenta {"driveId": ..., "id": ...}
-    - Se 409 (nameAlreadyExists), renomeia (milissegundos) e tenta de novo
-    - Monitora Location (202 respond-async) até concluir
+    Checa se a Clients.xlsx é acessível. Usa CLIENTS_TABLE_PATH como base.
     """
-    if not (DRIVE_ID and TEMPLATE_ITEM_ID and DEST_FOLDER_ITEM_ID):
-        raise RuntimeError("Faltam DRIVE_ID/TEMPLATE_ITEM_ID/DEST_FOLDER_ITEM_ID.")
+    root = extract_item_root_from_clients_path()
+    r = await graph("GET", root)
+    return {"status": r.status_code, "ok": r.status_code == 200}
 
-    copy_url = f"{GRAPH_BASE}/drives/{DRIVE_ID}/items/{TEMPLATE_ITEM_ID}/copy"
 
-    def _monitor(location: str) -> Dict[str, Any]:
-        for _ in range(30):  # ~60s
-            time.sleep(2)
-            rr = requests.get(location, headers=headers(), timeout=30)
-            if rr.status_code in (200, 201):
-                try:
-                    data = rr.json()
-                except Exception:
-                    data = {}
-                if "resourceId" in data:
-                    new_id = data["resourceId"]
-                    meta = gget(f"{GRAPH_BASE}/drives/{DRIVE_ID}/items/{new_id}")
-                    return meta.json() if meta.status_code == 200 else {"id": new_id}
-                if "id" in data:
-                    return data
-                return data
-            if rr.status_code >= 400:
-                raise RuntimeError(f"Monitor error {rr.status_code}: {rr.text}")
-        raise RuntimeError("Timeout no monitor da cópia.")
+async def check_item_exists_by_id(item_id: str) -> Dict[str, Any]:
+    r = await graph("GET", f"/drives/{DRIVE_ID}/items/{item_id}")
+    return {"status": r.status_code, "ok": r.status_code == 200}
 
-    def _try_copy(body: dict) -> Dict[str, Any]:
-        r = gpost(copy_url, json=body, extra_headers={"Prefer": "respond-async"})
-        # Sucesso imediato
-        if r.status_code in (200, 201):
-            try:
-                data = r.json()
-                if "id" in data:
-                    return data
-            except Exception:
-                pass
-        # Accepted com Location
-        if r.status_code == 202:
-            location = r.headers.get("Location") or r.headers.get("location")
-            if not location:
-                try:
-                    data = r.json()
-                    if "id" in data:
-                        return data
-                except Exception:
-                    pass
-                raise RuntimeError("Cópia sem Location (monitor).")
-            return _monitor(location)
 
-        # 409: já existe nome → renomeia e tenta de novo
-        if r.status_code == 409:
-            millis = int(time.time() * 1000)
-            new_name = body.get("name") or file_name
-            base, dot, ext = new_name.partition(".")
-            new_name = f"{base}_{millis}{dot}{ext}"
-            body2 = dict(body)
-            body2["name"] = new_name
-            r2 = gpost(copy_url, json=body2, extra_headers={"Prefer": "respond-async"})
-            if r2.status_code in (200, 201):
-                try:
-                    data = r2.json()
-                    if "id" in data:
-                        return data
-                except Exception:
-                    pass
-            if r2.status_code == 202:
-                location = r2.headers.get("Location") or r2.headers.get("location")
-                if not location:
-                    raise RuntimeError("Cópia (retry) sem Location.")
-                return _monitor(location)
-            raise RuntimeError(f"Copy retry error {r2.status_code}: {r2.text}")
-
-        # Outros erros
-        raise RuntimeError(f"Graph POST {r.status_code}: {r.text}")
-
-    # 1) parentReference somente com id
-    body_primary = {
-        "name": file_name,
-        "parentReference": {"id": DEST_FOLDER_ITEM_ID},
-        "conflictBehavior": "rename",
+async def add_row_to_clients(chat_id: str, excel_graph_path: str,
+                             worksheet_name: str, table_name: str) -> None:
+    """
+    Adiciona linha na tabela Clientes (colunas: chat_id, excel_path, worksheet_name, table_name, created_at).
+    """
+    body = {
+        "values": [[
+            chat_id,
+            excel_graph_path,
+            worksheet_name,
+            table_name,
+            datetime.now().strftime("%d/%m/%Y %H:%M")
+        ]]
     }
-    try:
-        return _try_copy(body_primary)
-    except Exception as e1:
-        if DEBUG:
-            print("copy primary failed:", e1)
+    url = f"{CLIENTS_TABLE_PATH}/workbook/worksheets('{CLIENTS_WORKSHEET_NAME}')/tables('{CLIENTS_TABLE_NAME}')/rows/add"
+    r = await graph("POST", url, content=json.dumps(body))
+    if r.status_code >= 400:
+        raise HTTPException(status_code=r.status_code, detail=r.text)
 
-    # 2) Fallback com driveId + id
-    body_fallback = {
-        "name": file_name,
-        "parentReference": {"driveId": DRIVE_ID, "id": DEST_FOLDER_ITEM_ID},
-        "conflictBehavior": "rename",
-    }
-    return _try_copy(body_fallback)
 
-# -----------------------------------------------------------
-# Planilha de Clientes: upsert e lookup
-# -----------------------------------------------------------
-def clients_item_path() -> str:
+async def get_client_row(chat_id: str) -> Optional[Dict[str, Any]]:
     """
-    Retorna o item_path padrão da planilha Clientes.xlsx:
-      /drives/{driveId}/items/{itemId}
+    Lê linhas da tabela Clientes e busca chat_id.
+    Retorna dict com colunas se achar; None se não.
     """
-    if not CLIENTS_TABLE_PATH:
-        raise RuntimeError("CLIENTS_TABLE_PATH não definido.")
-    return CLIENTS_TABLE_PATH  # já no formato /drives/.../items/...
-
-def clients_get_by_chat_id(chat_id: int) -> Optional[Dict[str, Any]]:
-    """
-    Busca na tabela Clientes (Plan1) uma linha com o chat_id informado.
-    Espera colunas: chat_id | nome | excel_path | worksheet_name | table_name | created_at
-    """
-    rows = excel_list_rows(clients_item_path(), CLIENTS_WORKSHEET_NAME, CLIENTS_TABLE_NAME, top=2000)
+    url = f"{CLIENTS_TABLE_PATH}/workbook/worksheets('{CLIENTS_WORKSHEET_NAME}')/tables('{CLIENTS_TABLE_NAME}')/rows"
+    r = await graph("GET", url)
+    if r.status_code >= 400:
+        raise HTTPException(status_code=r.status_code, detail=r.text)
+    rows = r.json().get("value", [])
     for row in rows:
-        cols = row + [""] * 6
-        cid, nome, excel_path, ws, tbl, created_at = cols[:6]
-        if str(cid).strip() == str(chat_id):
-            return {
-                "chat_id": str(cid).strip(),
-                "nome": str(nome).strip(),
-                "excel_path": str(excel_path).strip(),
-                "worksheet_name": (ws or DEFAULT_WORKSHEET_NAME),
-                "table_name": (tbl or DEFAULT_TABLE_NAME),
-                "created_at": str(created_at).strip(),
+        vals = row.get("values", [[]])[0]
+        if not vals:
+            continue
+        if str(vals[0]).strip() == str(chat_id):
+            # mapear colunas
+            out = {
+                "chat_id": vals[0],
+                "excel_path": vals[1],
+                "worksheet_name": vals[2],
+                "table_name": vals[3],
+                "created_at": vals[4] if len(vals) > 4 else ""
             }
+            return out
     return None
 
-def clients_add_row(chat_id: int, nome: str, excel_item_id: str, worksheet: str, table: str):
+
+async def copy_template_for_user(file_name: str) -> Dict[str, Any]:
     """
-    Insere uma nova linha na tabela Clientes com os dados do cliente.
+    Copia o template usando /copy + monitor (corrige 202/Location).
+    Retorna {item_id, webUrl, graph_path}.
     """
-    item_path = f"/drives/{DRIVE_ID}/items/{excel_item_id}"
-    created_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    values = [str(chat_id), nome, item_path, worksheet, table, created_at]
-    excel_add_row_by_item_path(clients_item_path(), CLIENTS_WORKSHEET_NAME, CLIENTS_TABLE_NAME, values)
-
-def ensure_client_workbook(chat_id: int, nome: str) -> Tuple[str, str, str]:
-    """
-    Garante que o cliente tem uma planilha própria:
-      - Se já existir na Clientes.xlsx, retorna (item_path, worksheet, table)
-      - Senão, copia template -> cria registro na Clientes.xlsx -> retorna
-    """
-    # 1) tentar achar cliente
-    found = clients_get_by_chat_id(chat_id)
-    if found and found.get("excel_path"):
-        return found["excel_path"], found["worksheet_name"], found["table_name"]
-
-    # 2) copiar template para o cliente
-    safe_name = (nome or "Cliente").split()[0]
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    file_name = f"Planilha_{safe_name}_{ts}.xlsx"
-    meta = copy_template_for_user(file_name)
-    new_item_id = meta.get("id")
-    if not new_item_id:
-        raise RuntimeError(f"Falha ao obter id da planilha criada: {meta}")
-
-    # 3) gravar registro na Clientes.xlsx
-    clients_add_row(chat_id, safe_name, new_item_id, DEFAULT_WORKSHEET_NAME, DEFAULT_TABLE_NAME)
-
-    # 4) retornar caminho do arquivo do cliente
-    item_path = f"/drives/{DRIVE_ID}/items/{new_item_id}"
-    return item_path, DEFAULT_WORKSHEET_NAME, DEFAULT_TABLE_NAME
-
-# -----------------------------------------------------------
-# NLP simples (linguagem natural)
-# -----------------------------------------------------------
-ADD_REGEX = re.compile(r"^/add\s+(.+)$", re.IGNORECASE)
-FMT_REGEX = re.compile(
-    r"""(?P<data>(\d{1,2}/\d{1,2}/\d{2,4}|hoje|ontem))?
-        .*?
-        (?P<tipo>(compra|pagamento|recebimento|ganho|gastei|paguei))?
-        .*?
-        (?P<valor>\d+[.,]?\d*)
-        .*?
-        (?P<formapag>(pix|dinheiro|debito|débito|credito|crédito|cartao|cartão|boleto|transfer(ê|e)ncia)(\s+\w+)*)?
-        .*?
-        (?P<parcelas>\d{1,2}x)?
-    """,
-    re.IGNORECASE | re.VERBOSE,
-)
-
-def parse_amount(val_str: str) -> float:
-    s = val_str.strip().replace("R$", "").replace(" ", "")
-    if "," in s and s.count(",") == 1 and "." in s:
-        s = s.replace(".", "").replace(",", ".")
-    elif "," in s and "." not in s:
-        s = s.replace(",", ".")
-    return float(s)
-
-def normalize_date(s: Optional[str]) -> str:
-    if not s:
-        return datetime.now().strftime("%Y-%m-%d")
-    s = s.strip().lower()
-    if s == "hoje":
-        return datetime.now().strftime("%Y-%m-%d")
-    if s == "ontem":
-        return (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-    try:
-        return datetime.strptime(s, "%d/%m/%Y").strftime("%Y-%m-%d")
-    except Exception:
-        return datetime.now().strftime("%Y-%m-%d")
-
-def guess_group_and_category(desc: str) -> Tuple[str, str]:
-    d = (desc or "").lower()
-    grupos = {
-        "Gastos Fixos": ["aluguel", "água", "agua", "energia", "internet", "plano de saúde", "escola"],
-        "Assinatura": ["netflix", "amazon", "disney", "premiere", "spotify"],
-        "Gastos Variáveis": ["mercado", "farmácia", "farmacia", "combustível", "combustivel", "passeio", "ifood", "viagem", "restaurante"],
-        "Despesas Temporárias": ["financiamento", "iptu", "ipva", "empréstimo", "emprestimo"],
-        "Pagamento de Fatura": ["fatura", "cartão", "cartao"],
-        "Ganhos": ["salário", "salario", "vale", "renda extra", "pró labore", "pro labore"],
-        "Investimento": ["renda fixa", "renda variável", "renda variavel", "fii", "fundos imobiliários", "fundos imobiliarios"],
-        "Reserva": ["disney", "trocar de carro", "reserva"],
+    body = {
+        "name": file_name,
+        "parentReference": {
+            "driveId": DRIVE_ID,
+            "id": DEST_FOLDER_ITEM_ID
+        }
     }
-    for g, keys in grupos.items():
-        for k in keys:
-            if k in d:
-                if g == "Gastos Variáveis" and "restaurante" in d:
-                    return g, "Restaurante"
-                if g == "Assinatura" and "netflix" in d:
-                    return g, "Netflix"
-                if "farmácia" in d or "farmacia" in d:
-                    return g, "Farmácia"
-                if "mercado" in d:
-                    return g, "Mercado"
-                return g, k.capitalize()
-    return "Gastos Variáveis", "Outros"
+    path = f"/drives/{DRIVE_ID}/items/{TEMPLATE_ITEM_ID}/copy"
+    r = await graph("POST", path, content=json.dumps(body))
 
-def parse_free_text(text: str) -> Tuple[List[Any], Optional[str]]:
-    m = FMT_REGEX.search(text)
+    if r.status_code not in (202, 201, 200):
+        raise HTTPException(status_code=r.status_code, detail=f"Erro ao copiar modelo: {r.text}")
+
+    # Se já veio 201/200, ótimo, pegue Location se houver ou faça um GET por nome.
+    location = r.headers.get("Location")
+    if not location:
+        # Tenta achar por nome dentro da pasta destino
+        # (fallback – raramente necessário; manter simples)
+        await asyncio.sleep(2)
+
+    # Monitora o Location (quando há)
+    if location:
+        async with httpx.AsyncClient(timeout=60) as cli:
+            # usa o mesmo token
+            token = await get_access_token()
+            headers = {"Authorization": f"Bearer {token}"}
+            for _ in range(40):
+                res = await cli.get(location, headers=headers)
+                if res.status_code == 200:
+                    job = res.json()
+                    status = job.get("status")
+                    if status in ("completed", "succeeded", "success"):
+                        resource = job.get("resourceId") or job.get("resource", {}).get("id")
+                        if resource:
+                            item_meta = await graph_get_json(f"/drives/{DRIVE_ID}/items/{resource}")
+                            return {
+                                "item_id": item_meta["id"],
+                                "webUrl": item_meta.get("webUrl", ""),
+                                "graph_path": f"/drives/{DRIVE_ID}/items/{item_meta['id']}"
+                            }
+                        break
+                elif res.status_code in (201, 204):
+                    # alguns tenants retornam 201/204 quando conclui
+                    break
+                await asyncio.sleep(1)
+
+    # Sem Location ou monitor: procura por nome recém criado na pasta de destino
+    children = await graph_get_json(f"/drives/{DRIVE_ID}/items/{DEST_FOLDER_ITEM_ID}/children?$select=id,name,webUrl")
+    for it in children.get("value", []):
+        if it.get("name") == file_name:
+            return {
+                "item_id": it["id"],
+                "webUrl": it.get("webUrl", ""),
+                "graph_path": f"/drives/{DRIVE_ID}/items/{it['id']}"
+            }
+
+    raise HTTPException(status_code=500, detail="Falha ao localizar cópia do modelo (monitor).")
+
+
+async def append_row_to_user_excel(excel_graph_path: str, values: List[Any]) -> None:
+    """
+    Adiciona uma linha na tabela do Excel do cliente.
+    """
+    url = f"{excel_graph_path}/workbook/worksheets('{WORKSHEET_NAME}')/tables('{TABLE_NAME}')/rows/add"
+    body = {"values": [values]}
+    r = await graph("POST", url, content=json.dumps(body))
+    if r.status_code >= 400:
+        raise HTTPException(status_code=r.status_code, detail=r.text)
+
+
+# ---------------------------------------------------------------------
+# Parser simples (linguagem natural)
+# ---------------------------------------------------------------------
+PGTO_MAP = {
+    "pix": "Pix",
+    "cartao": "💳 cartão",
+    "cartão": "💳 cartão",
+    "dinheiro": "Dinheiro",
+    "debito": "Débito",
+    "débito": "Débito",
+    "credito": "Crédito",
+    "crédito": "Crédito",
+    "boleto": "Boleto",
+}
+
+CATEG_MAP = {
+    "mercado": "Mercado",
+    "farmácia": "Farmácia",
+    "farmacia": "Farmácia",
+    "restaurante": "Restaurante",
+    "ifood": "IFood",
+    "combustível": "Combustível",
+    "combustivel": "Combustível",
+    "viagem": "Viagem",
+    "assinatura": "Assinatura",
+    "netflix": "Assinatura",
+    "spotify": "Assinatura",
+}
+
+def parse_pt_br_amount(txt: str) -> Optional[float]:
+    m = re.search(r"(\d{1,3}(?:\.\d{3})*|\d+)(?:[,\.](\d{1,2}))?", txt)
     if not m:
-        return [], "Não entendi. Ex.: 'gastei 45,90 no mercado via cartão hoje'."
+        return None
+    inteiro = m.group(1).replace(".", "")
+    frac = m.group(2) or "00"
+    if len(frac) == 1:
+        frac += "0"
+    return float(f"{inteiro}.{frac}")
 
-    data = normalize_date(m.group("data"))
-    valor = parse_amount(m.group("valor"))
 
-    tipo = "Saída"
-    if m.group("tipo") and m.group("tipo").lower() in ("recebimento", "ganho"):
-        tipo = "Entrada"
+def guess_pgto(txt: str) -> str:
+    txtl = txt.lower()
+    for k, v in PGTO_MAP.items():
+        if k in txtl:
+            return v
+    return "A vista"
 
-    forma_bruta = (m.group("formapag") or "").strip()
-    forma = ""
-    if forma_bruta:
-        f = forma_bruta.lower().replace("cartao", "cartão")
-        if "crédito" in f or "credito" in f or "cartão" in f:
-            forma = "💳 " + f
-        else:
-            forma = f.capitalize()
 
-    condicao = "À vista" if tipo == "Saída" else ""
-    parc = m.group("parcelas")
+def guess_categoria(txt: str) -> str:
+    txtl = txt.lower()
+    for k, v in CATEG_MAP.items():
+        if k in txtl:
+            return v
+    return "Outros"
+
+
+def guess_data(txt: str) -> date:
+    # procura dd/mm/aaaa ou dd/mm
+    m = re.search(r"\b(\d{1,2})/(\d{1,2})(?:/(\d{4}))?\b", txt)
+    if m:
+        d, mth, y = m.group(1), m.group(2), m.group(3)
+        if not y:
+            y = str(datetime.now().year)
+        return date(int(y), int(mth), int(d))
+    if "ontem" in txt.lower():
+        return date.fromordinal(date.today().toordinal() - 1)
+    return date.today()
+
+
+def parse_message_freeform(text: str) -> Dict[str, Any]:
+    """
+    Retorna: {data, tipo, grupo, categoria, descricao, valor, forma_pgto, condicao}
+    """
+    valor = parse_pt_br_amount(text)
+    data_lanc = guess_data(text)
+    forma = guess_pgto(text)
+    categoria = guess_categoria(text)
+    # heurística simples
+    tipo = "Saída" if "gastei" in text.lower() or "comprei" in text.lower() else "Entrada"
+    grupo = "Gastos Variáveis" if tipo == "Saída" else "Ganhos"
+
+    # parcelas
+    condicao = "A vista"
+    parc = re.search(r"(\d+)\s*x", text.lower())
     if parc:
-        condicao = parc  # ex.: 12x
+        condicao = f"{parc.group(1)}x"
 
-    desc = text.strip()
-    grupo, categoria = guess_group_and_category(desc)
+    # descrição: pega trechos após 'no/na/em' se houver
+    desc = ""
+    md = re.search(r"\bno\s+([^\d]+)", text.lower())
+    if md:
+        desc = md.group(1).strip().title()
+    if not desc:
+        desc = categoria
 
-    values = [data, tipo, grupo, categoria, desc, valor, forma, condicao]
-    return values, None
+    return {
+        "data": data_lanc.strftime("%d/%m/%Y"),
+        "tipo": tipo,
+        "grupo": grupo,
+        "categoria": categoria,
+        "descricao": desc,
+        "valor": f"{valor:.2f}" if valor is not None else "",
+        "forma_pgto": forma,
+        "condicao": condicao,
+    }
 
-# -----------------------------------------------------------
-# Telegram helpers
-# -----------------------------------------------------------
-async def tg_send(chat_id: int, text: str):
+
+# ---------------------------------------------------------------------
+# Telegram
+# ---------------------------------------------------------------------
+class TgMessage(BaseModel):
+    update_id: Optional[int] = None
+    message: Optional[Dict[str, Any]] = None
+    edited_message: Optional[Dict[str, Any]] = None
+
+
+async def ensure_user_excel(chat_id: str, first_name: str) -> Dict[str, Any]:
+    """
+    Garante que o usuário possua uma planilha. Se existir no Clientes, reaproveita.
+    Se não existir, copia o template e registra.
+    Retorna dict {excel_graph_path, item_id, webUrl}.
+    """
+    # 1) tenta buscar
+    row = await get_client_row(chat_id)
+    if row:
+        return {
+            "excel_graph_path": row["excel_path"],
+            "item_id": row["excel_path"].split("/")[-1],
+            "webUrl": ""  # opcional
+        }
+
+    # 2) copia template
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    file_name = f"Planilha_{first_name}_{ts}.xlsx"
+    info = await copy_template_for_user(file_name)
+
+    # 3) registra no Clientes
+    await add_row_to_clients(
+        chat_id=chat_id,
+        excel_graph_path=info["graph_path"],  # ex.: /drives/{driveId}/items/{itemId}
+        worksheet_name=WORKSHEET_NAME,
+        table_name=TABLE_NAME
+    )
+
+    return {
+        "excel_graph_path": info["graph_path"],
+        "item_id": info["item_id"],
+        "webUrl": info["webUrl"]
+    }
+
+
+async def tg_send(chat_id: str, text: str) -> None:
     if not TELEGRAM_TOKEN:
         return
-    try:
-        async with httpx.AsyncClient(timeout=12) as client:
-            await client.post(
-                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                json={"chat_id": chat_id, "text": text},
-            )
-    except Exception as e:
-        if DEBUG:
-            print("tg_send error:", e)
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    data = {"chat_id": chat_id, "text": text}
+    async with httpx.AsyncClient(timeout=30) as cli:
+        await cli.post(url, data=data)
 
-# -----------------------------------------------------------
-# Rotas
-# -----------------------------------------------------------
+
+# ---------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------
 @app.get("/")
-def root():
+async def root():
     return {"status": "ok"}
 
+
 @app.get("/diag")
-def diag():
-    out = {
+async def diag():
+    checks = {
         "envs": {
             "DRIVE_ID": bool(DRIVE_ID),
             "TEMPLATE_ITEM_ID": bool(TEMPLATE_ITEM_ID),
@@ -405,91 +431,90 @@ def diag():
             "CLIENTS_TABLE_PATH": bool(CLIENTS_TABLE_PATH),
         }
     }
-    try:
-        if DRIVE_ID and TEMPLATE_ITEM_ID:
-            u = f"{GRAPH_BASE}/drives/{DRIVE_ID}/items/{TEMPLATE_ITEM_ID}"
-            r = gget(u); out["template_item"] = {"status": r.status_code, "ok": r.ok}
-        if DRIVE_ID and DEST_FOLDER_ITEM_ID:
-            u = f"{GRAPH_BASE}/drives/{DRIVE_ID}/items/{DEST_FOLDER_ITEM_ID}"
-            r = gget(u); out["dest_folder"] = {"status": r.status_code, "ok": r.ok}
-        if CLIENTS_TABLE_PATH:
-            u = f"{GRAPH_BASE}{CLIENTS_TABLE_PATH}"
-            r = gget(u); out["clients_file"] = {"status": r.status_code, "ok": r.ok}
-        return JSONResponse(content=out)
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+    # template/dest
+    tpl = await check_item_exists_by_id(TEMPLATE_ITEM_ID) if DRIVE_ID and TEMPLATE_ITEM_ID else {"status": 400, "ok": False}
+    dst = await check_item_exists_by_id(DEST_FOLDER_ITEM_ID) if DRIVE_ID and DEST_FOLDER_ITEM_ID else {"status": 400, "ok": False}
+    cli = await ensure_clients_sheet_ok() if CLIENTS_TABLE_PATH else {"status": 400, "ok": False}
+    checks["template_item"] = tpl
+    checks["dest_folder"] = dst
+    checks["clients_file"] = cli
+    return checks
+
 
 @app.post("/telegram/webhook")
-async def telegram_webhook(req: Request):
-    body = await req.json()
-    msg = body.get("message") or {}
-    chat = msg.get("chat") or {}
-    from_user = msg.get("from") or {}
-    chat_id = chat.get("id")
+async def telegram_webhook(payload: TgMessage):
+    msg = payload.message or payload.edited_message
+    if not msg:
+        return {"ok": True}
+
+    chat_id = str(msg["chat"]["id"])
     text = (msg.get("text") or "").strip()
-    first_name = (from_user.get("first_name") or "").strip()
-
-    if not chat_id or not text:
-        return {"ok": True}
-
-    # /start: garante planilha do cliente e cadastra na "Clientes"
-    if text.lower().startswith("/start"):
-        try:
-            _item_path, _ws, _tbl = ensure_client_workbook(chat_id, first_name or "Cliente")
-            await tg_send(chat_id,
-                "Olá! Pode me contar seus gastos/recebimentos em linguagem natural.\n"
-                "Exemplos:\n"
-                "• gastei 45,90 no mercado via cartão hoje\n"
-                "• comprei remédio 34 na farmácia via pix\n"
-                "• ganhei 800 de salário\n"
-                "Se preferir: /add 07/10/2025;Compra;Mercado;Almoço;45,90;Cartão"
-            )
-        except Exception as e:
-            await tg_send(chat_id, f"❌ Erro ao preparar sua planilha: {e}")
-        return {"ok": True}
-
-    # /add DD/MM/AAAA;Tipo;Categoria;Descrição;Valor;FormaPagamento
-    m = ADD_REGEX.match(text)
-    if m:
-        parts = [p.strip() for p in m.group(1).split(";")]
-        if len(parts) != 6:
-            await tg_send(chat_id, "❗ Formato: /add DD/MM/AAAA;Tipo;Categoria;Descrição;Valor;FormaPagamento")
-            return {"ok": True}
-        data_br, tipo, categoria, descricao, valor_str, forma = parts
-        try:
-            dt = datetime.strptime(data_br, "%d/%m/%Y")
-            data_iso = dt.strftime("%Y-%m-%d")
-        except Exception:
-            await tg_send(chat_id, "❗ Data inválida. Use DD/MM/AAAA.")
-            return {"ok": True}
-        try:
-            valor = parse_amount(valor_str)
-        except Exception:
-            await tg_send(chat_id, "❗ Valor inválido. Ex.: 123,45")
-            return {"ok": True}
-        grupo, _ = guess_group_and_category(descricao)
-        condicao = ""
-        values = [data_iso, tipo, grupo, categoria or "Outros", descricao, valor, forma, condicao]
-
-        try:
-            item_path, ws, tbl = ensure_client_workbook(chat_id, first_name or "Cliente")
-            excel_add_row_by_item_path(item_path, ws, tbl, values)
-            await tg_send(chat_id, "✅ Lançado!")
-        except Exception as e:
-            await tg_send(chat_id, f"❌ Erro ao lançar no Excel: {e}")
-        return {"ok": True}
-
-    # Linguagem natural
-    values, err = parse_free_text(text)
-    if err:
-        await tg_send(chat_id, err)
-        return {"ok": True}
+    first_name = msg["chat"].get("first_name") or "User"
 
     try:
-        item_path, ws, tbl = ensure_client_workbook(chat_id, first_name or "Cliente")
-        excel_add_row_by_item_path(item_path, ws, tbl, values)
-        await tg_send(chat_id, "✅ Lançado!")
-    except Exception as e:
-        await tg_send(chat_id, f"❌ Erro ao lançar no Excel: {e}")
+        # /start → garante planilha
+        if text.lower().startswith("/start"):
+            info = await ensure_user_excel(chat_id, first_name)
+            await tg_send(chat_id, "Olá! Pode me contar seus gastos/recebimentos em linguagem natural.\n"
+                                    "Exemplos:\n• gastei 45,90 no mercado via cartão hoje\n"
+                                    "• comprei remédio 34 na farmácia via pix\n"
+                                    "• ganhei 800 de salário\n"
+                                    "Se preferir: /add 07/10/2025;Compra;Mercado;Almoço;45,90;Cartão")
+            return {"ok": True}
 
-    return {"ok": True}
+        # /add DD/MM/AAAA;Tipo;Grupo|Categoria;Descricao;Valor;Forma
+        if text.lower().startswith("/add"):
+            try:
+                _, rest = text.split(" ", 1)
+                partes = [p.strip() for p in rest.split(";")]
+                dt, tipo, categoria, descricao, valor, forma = partes[:6]
+                grupo = "Ganhos" if tipo.lower().startswith("ent") else "Gastos Variáveis"
+                cond = "A vista"
+            except Exception:
+                await tg_send(chat_id, "Formato inválido. Use:\n/add 07/10/2025;Compra;Mercado;Almoço;45,90;Cartão")
+                return {"ok": True}
+
+            # Garante excel
+            info = await ensure_user_excel(chat_id, first_name)
+            row = [dt, tipo, grupo, categoria, descricao, valor.replace(",", "."), forma, "A vista"]
+            await append_row_to_user_excel(info["excel_graph_path"], row)
+            await tg_send(chat_id, "Lançado!")
+            return {"ok": True}
+
+        # linguagem natural
+        info = await ensure_user_excel(chat_id, first_name)
+        parsed = parse_message_freeform(text)
+        if not parsed.get("valor"):
+            await tg_send(chat_id, "Não entendi o valor. Ex.: 'gastei 45,90 no mercado via cartão hoje'.")
+            return {"ok": True}
+
+        row = [
+            parsed["data"],
+            parsed["tipo"],
+            parsed["grupo"],
+            parsed["categoria"],
+            parsed["descricao"],
+            parsed["valor"].replace(",", "."),
+            parsed["forma_pgto"],
+            parsed["condicao"],
+        ]
+        await append_row_to_user_excel(info["excel_graph_path"], row)
+        await tg_send(chat_id, "Lançado!")
+        return {"ok": True}
+
+    except HTTPException as e:
+        log("HTTPException", e.status_code, e.detail)
+        await tg_send(chat_id, f"❌ Erro: {e.detail}")
+        return JSONResponse(status_code=200, content={"ok": True})
+    except Exception as e:
+        log("Exception", repr(e))
+        await tg_send(chat_id, f"❌ Erro inesperado: {e}")
+        return JSONResponse(status_code=200, content={"ok": True})
+
+
+# Opcional: endpoint de teste de cópia manual (POST manda JSON {"name": "arquivo.xlsx"})
+@app.post("/test-copy")
+async def test_copy(payload: Dict[str, Any]):
+    name = payload.get("name") or f"Planilha_Teste_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    info = await copy_template_for_user(name)
+    return info
