@@ -27,17 +27,18 @@ GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
 # Template e destino (SharePoint do site)
 DRIVE_ID = os.getenv("DRIVE_ID", "").strip()
-TEMPLATE_ITEM_ID = os.getenv("TEMPLATE_ITEM_ID", "").strip()          # modelo Lancamentos.xlsx
-DEST_FOLDER_ITEM_ID = os.getenv("DEST_FOLDER_ITEM_ID", "").strip()    # pasta Planilhas
+TEMPLATE_ITEM_ID = os.getenv("TEMPLATE_ITEM_ID", "").strip()          # modelo Lancamentos.xlsx (ID do arquivo no site)
+DEST_FOLDER_ITEM_ID = os.getenv("DEST_FOLDER_ITEM_ID", "").strip()    # pasta Planilhas (ID da pasta no site)
 
 # Planilha de Clientes (onde registramos o chat_id -> excel_path)
-CLIENTS_TABLE_PATH = os.getenv("CLIENTS_TABLE_PATH", "").strip()      # /drives/{driveId}/items/{itemId}
+# Formato: /drives/{driveId}/items/{itemId}
+CLIENTS_TABLE_PATH = os.getenv("CLIENTS_TABLE_PATH", "").strip()
 CLIENTS_WORKSHEET_NAME = os.getenv("CLIENTS_WORKSHEET_NAME", "Plan1")
 CLIENTS_TABLE_NAME = os.getenv("CLIENTS_TABLE_NAME", "Clientes")
 
 # Padrões da planilha de lançamentos do cliente
 DEFAULT_WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "Plan1")
-DEFAULT_TABLE_NAME = os.getenv("TABLE_NAME", "Lançamentos")
+DEFAULT_TABLE_NAME = os.getenv("TABLE_NAME", "Lancamentos")  # defina no Render exatamente como está na Tabela
 
 DEBUG = os.getenv("DEBUG", "0") == "1"
 
@@ -90,7 +91,7 @@ def excel_add_row_by_item_path(item_path: str, worksheet: str, table: str, value
         raise RuntimeError(f"Graph error {r.status_code}: {r.text}")
     return r.json()
 
-def excel_list_rows(item_path: str, worksheet: str, table: str, top: int = 500) -> List[List[Any]]:
+def excel_list_rows(item_path: str, worksheet: str, table: str, top: int = 2000) -> List[List[Any]]:
     url = f"{GRAPH_BASE}{item_path}/workbook/worksheets('{worksheet}')/tables('{table}')/rows?$top={top}"
     r = gget(url)
     if r.status_code >= 300:
@@ -102,45 +103,22 @@ def excel_list_rows(item_path: str, worksheet: str, table: str, top: int = 500) 
     return rows
 
 # -----------------------------------------------------------
-# Cópia do modelo para criar planilha do cliente (com fallback)
+# Cópia do modelo para criar planilha do cliente (com 409 handling + fallback)
 # -----------------------------------------------------------
 def copy_template_for_user(file_name: str) -> Dict[str, Any]:
     """
-    POST /drives/{DRIVE_ID}/items/{TEMPLATE_ITEM_ID}/copy  ->  202 + Location
-    Faz poll no Location, retorna metadata do novo item.
-    Tenta primeiro parentReference {id}; se der 400, tenta {driveId, id}.
+    Copia TEMPLATE_ITEM_ID -> DEST_FOLDER_ITEM_ID (no drive do site).
+    - Primeiro tenta parentReference {"id": ...}
+    - Se 400, tenta {"driveId": ..., "id": ...}
+    - Se 409 (nameAlreadyExists), renomeia (milissegundos) e tenta de novo
+    - Monitora Location (202 respond-async) até concluir
     """
     if not (DRIVE_ID and TEMPLATE_ITEM_ID and DEST_FOLDER_ITEM_ID):
         raise RuntimeError("Faltam DRIVE_ID/TEMPLATE_ITEM_ID/DEST_FOLDER_ITEM_ID.")
 
     copy_url = f"{GRAPH_BASE}/drives/{DRIVE_ID}/items/{TEMPLATE_ITEM_ID}/copy"
 
-    def _do_copy(body: dict) -> Dict[str, Any]:
-        r = gpost(copy_url, json=body, extra_headers={"Prefer": "respond-async"})
-        if r.status_code not in (202, 201, 200):
-            raise RuntimeError(f"Graph POST {r.status_code}: {r.text}")
-
-        # Alguns tenants retornam já o item no corpo
-        if r.status_code in (200, 201):
-            try:
-                data = r.json()
-                if "id" in data:
-                    return data
-            except Exception:
-                pass
-
-        location = r.headers.get("Location") or r.headers.get("location")
-        if not location:
-            # Se não veio Location, tentar ler eventuais dados no corpo
-            try:
-                data = r.json()
-                if "id" in data:
-                    return data
-            except Exception:
-                pass
-            raise RuntimeError("Cópia sem Location (monitor).")
-
-        # Poll do monitor
+    def _monitor(location: str) -> Dict[str, Any]:
         for _ in range(30):  # ~60s
             time.sleep(2)
             rr = requests.get(location, headers=headers(), timeout=30)
@@ -149,7 +127,6 @@ def copy_template_for_user(file_name: str) -> Dict[str, Any]:
                     data = rr.json()
                 except Exception:
                     data = {}
-                # Alguns monitores retornam resourceId
                 if "resourceId" in data:
                     new_id = data["resourceId"]
                     meta = gget(f"{GRAPH_BASE}/drives/{DRIVE_ID}/items/{new_id}")
@@ -161,24 +138,74 @@ def copy_template_for_user(file_name: str) -> Dict[str, Any]:
                 raise RuntimeError(f"Monitor error {rr.status_code}: {rr.text}")
         raise RuntimeError("Timeout no monitor da cópia.")
 
-    # 1) Tentativa principal: parentReference só com id (mais aceito no SharePoint)
+    def _try_copy(body: dict) -> Dict[str, Any]:
+        r = gpost(copy_url, json=body, extra_headers={"Prefer": "respond-async"})
+        # Sucesso imediato
+        if r.status_code in (200, 201):
+            try:
+                data = r.json()
+                if "id" in data:
+                    return data
+            except Exception:
+                pass
+        # Accepted com Location
+        if r.status_code == 202:
+            location = r.headers.get("Location") or r.headers.get("location")
+            if not location:
+                try:
+                    data = r.json()
+                    if "id" in data:
+                        return data
+                except Exception:
+                    pass
+                raise RuntimeError("Cópia sem Location (monitor).")
+            return _monitor(location)
+
+        # 409: já existe nome → renomeia e tenta de novo
+        if r.status_code == 409:
+            millis = int(time.time() * 1000)
+            new_name = body.get("name") or file_name
+            base, dot, ext = new_name.partition(".")
+            new_name = f"{base}_{millis}{dot}{ext}"
+            body2 = dict(body)
+            body2["name"] = new_name
+            r2 = gpost(copy_url, json=body2, extra_headers={"Prefer": "respond-async"})
+            if r2.status_code in (200, 201):
+                try:
+                    data = r2.json()
+                    if "id" in data:
+                        return data
+                except Exception:
+                    pass
+            if r2.status_code == 202:
+                location = r2.headers.get("Location") or r2.headers.get("location")
+                if not location:
+                    raise RuntimeError("Cópia (retry) sem Location.")
+                return _monitor(location)
+            raise RuntimeError(f"Copy retry error {r2.status_code}: {r2.text}")
+
+        # Outros erros
+        raise RuntimeError(f"Graph POST {r.status_code}: {r.text}")
+
+    # 1) parentReference somente com id
     body_primary = {
         "name": file_name,
         "parentReference": {"id": DEST_FOLDER_ITEM_ID},
         "conflictBehavior": "rename",
     }
     try:
-        return _do_copy(body_primary)
+        return _try_copy(body_primary)
     except Exception as e1:
         if DEBUG:
             print("copy primary failed:", e1)
-        # 2) Fallback: usar {driveId, id}
-        body_fallback = {
-            "name": file_name,
-            "parentReference": {"driveId": DRIVE_ID, "id": DEST_FOLDER_ITEM_ID},
-            "conflictBehavior": "rename",
-        }
-        return _do_copy(body_fallback)
+
+    # 2) Fallback com driveId + id
+    body_fallback = {
+        "name": file_name,
+        "parentReference": {"driveId": DRIVE_ID, "id": DEST_FOLDER_ITEM_ID},
+        "conflictBehavior": "rename",
+    }
+    return _try_copy(body_fallback)
 
 # -----------------------------------------------------------
 # Planilha de Clientes: upsert e lookup
@@ -190,7 +217,7 @@ def clients_item_path() -> str:
     """
     if not CLIENTS_TABLE_PATH:
         raise RuntimeError("CLIENTS_TABLE_PATH não definido.")
-    return CLIENTS_TABLE_PATH  # já deve estar no formato /drives/.../items/...
+    return CLIENTS_TABLE_PATH  # já no formato /drives/.../items/...
 
 def clients_get_by_chat_id(chat_id: int) -> Optional[Dict[str, Any]]:
     """
@@ -199,10 +226,8 @@ def clients_get_by_chat_id(chat_id: int) -> Optional[Dict[str, Any]]:
     """
     rows = excel_list_rows(clients_item_path(), CLIENTS_WORKSHEET_NAME, CLIENTS_TABLE_NAME, top=2000)
     for row in rows:
-        # proteger contra linhas curtas
         cols = row + [""] * 6
         cid, nome, excel_path, ws, tbl, created_at = cols[:6]
-        # chat_id na planilha fica como texto; comparo string
         if str(cid).strip() == str(chat_id):
             return {
                 "chat_id": str(cid).strip(),
@@ -217,7 +242,6 @@ def clients_get_by_chat_id(chat_id: int) -> Optional[Dict[str, Any]]:
 def clients_add_row(chat_id: int, nome: str, excel_item_id: str, worksheet: str, table: str):
     """
     Insere uma nova linha na tabela Clientes com os dados do cliente.
-    excel_item_id -> montamos o item_path do arquivo do cliente
     """
     item_path = f"/drives/{DRIVE_ID}/items/{excel_item_id}"
     created_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
@@ -252,7 +276,7 @@ def ensure_client_workbook(chat_id: int, nome: str) -> Tuple[str, str, str]:
     return item_path, DEFAULT_WORKSHEET_NAME, DEFAULT_TABLE_NAME
 
 # -----------------------------------------------------------
-# NLP simples
+# NLP simples (linguagem natural)
 # -----------------------------------------------------------
 ADD_REGEX = re.compile(r"^/add\s+(.+)$", re.IGNORECASE)
 FMT_REGEX = re.compile(
