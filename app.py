@@ -5,6 +5,7 @@ import sqlite3
 import secrets
 import string
 import asyncio
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple, List
 
@@ -42,6 +43,7 @@ DEST_FOLDER_ITEM_ID = os.getenv("DEST_FOLDER_ITEM_ID")
 # =========================================================
 # [LICENÇAS] ENVs / DB
 # =========================================================
+# IMPORTANTE: Carregamos o ADMIN_TELEGRAM_ID como string para evitar problemas de tipo
 ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID")
 SQLITE_PATH = os.getenv("SQLITE_PATH", "/data/db.sqlite")
 LICENSE_ENFORCE = os.getenv("LICENSE_ENFORCE", "1") == "1"
@@ -133,12 +135,10 @@ def bind_license_to_chat(chat_id: str, license_key: str):
         con.close()
         return False, "Essa licença já foi usada por outro Telegram."
 
-    # Tenta inserir, se o chat_id não existir
     con.execute("""
         INSERT OR IGNORE INTO clients(chat_id, created_at) VALUES(?,?)
     """, (str(chat_id), _now_iso()))
 
-    # Atualiza a licença e a data da última interação
     con.execute("""
         UPDATE clients SET license_key=?, last_seen_at=? WHERE chat_id=?
     """, (license_key, _now_iso(), str(chat_id)))
@@ -158,8 +158,8 @@ def get_client(chat_id: str):
 
 def set_client_file(chat_id: str, file_scope: str, drive_id: Optional[str], item_id: str):
     con = _db()
-    con.execute("""UPDATE clients SET file_scope=?, drive_id=?, item_id=?, last_seen_at=? WHERE chat_id=?""",
-                (file_scope, drive_id, item_id, _now_iso(), str(chat_id)))
+    con.execute("""UPDATE clients SET file_scope=?, drive_id=?, item_id=?, last_seen_at=? WHERE chat_id=?
+                   """, (file_scope, drive_id, item_id, _now_iso(), str(chat_id)))
     con.commit(); con.close()
 
 def require_active_license(chat_id: str):
@@ -200,10 +200,11 @@ def msal_token():
         raise RuntimeError(f"MSAL error: {result}")
     return result["access_token"]
 
+# 🔑 NOVAS FUNÇÕES: Cópia e Configuração de Arquivo por Cliente
 async def _graph_copy_file(template_item_id: str, drive_id: str, dest_folder_id: str, new_file_name: str) -> Optional[str]:
     """Copia o arquivo modelo e retorna o ID do novo arquivo (item_id)."""
     if not all([template_item_id, drive_id, dest_folder_id]):
-        raise ValueError("Variáveis de ambiente TEMPLATE_ITEM_ID, DRIVE_ID e DEST_FOLDER_ITEM_ID devem estar configuradas.")
+        raise ValueError("Variáveis de ambiente de template e destino devem estar configuradas.")
 
     token = msal_token()
     source_url = f"{GRAPH_BASE}/drives/{drive_id}/items/{template_item_id}/copy"
@@ -215,26 +216,31 @@ async def _graph_copy_file(template_item_id: str, drive_id: str, dest_folder_id:
     if r.status_code != 202:
         raise RuntimeError(f"Erro ao iniciar cópia do template. Código: {r.status_code}, Detalhe: {r.text}")
 
-    # A cópia é assíncrona. Espera simplificada e busca pelo nome.
+    # Espera 5 segundos e tenta buscar o item pelo nome (simplificação)
     await asyncio.sleep(5)
     search_url = f"{GRAPH_BASE}/drives/{drive_id}/items/{dest_folder_id}/children"
+    
     async with httpx.AsyncClient(timeout=15) as client:
-        search_r = await client.get(search_url, headers={"Authorization": f"Bearer {token}"}, params={"$filter": f"name eq '{new_file_name}'"})
+        search_r = await client.get(
+            search_url, 
+            headers={"Authorization": f"Bearer {token}"}, 
+            params={"$filter": f"name eq '{new_file_name}'"}
+        )
     
     if search_r.status_code >= 300:
         raise RuntimeError(f"Falha ao buscar o arquivo copiado. Detalhe: {search_r.text}")
     
     data = search_r.json()
-    if data.get('value'):
+    if data.get('value') and len(data['value']) > 0:
         return data['value'][0].get('id')
     
-    raise RuntimeError("Não foi possível encontrar o ID da planilha recém-criada.")
+    raise RuntimeError("Não foi possível encontrar o ID da planilha recém-criada após a cópia.")
 
 async def setup_client_file(chat_id: str) -> Tuple[bool, Optional[str]]:
     """Cria o arquivo de lançamento para o cliente e vincula ao chat_id."""
     cli = get_client(chat_id)
     if cli and cli["item_id"]:
-        return True, None
+        return True, None # Arquivo já configurado
 
     new_file_name = f"Lancamentos - {chat_id}.xlsx"
     try:
@@ -249,6 +255,8 @@ async def setup_client_file(chat_id: str) -> Tuple[bool, Optional[str]]:
     return True, None
 
 
+# 🔑 FUNÇÕES DE ACESSO AO EXCEL ATUALIZADAS PARA O CLIENTE
+
 def _build_workbook_rows_add_url(excel_path: str) -> str:
     if "/drive/items/" in excel_path:
         return f"{GRAPH_BASE}{excel_path}/workbook/worksheets('{WORKSHEET_NAME}')/tables('{TABLE_NAME}')/rows/add"
@@ -259,9 +267,12 @@ def _build_workbook_rows_add_url(excel_path: str) -> str:
 def excel_path_for_chat(chat_id: str) -> str:
     """Busca o caminho da planilha do cliente ou retorna o caminho global."""
     cli = get_client(chat_id)
+    
+    # 1. Tenta usar a planilha específica do cliente (item_id do DB)
     if cli and cli.get("item_id") and cli.get("drive_id"):
         return f"/drives/{cli['drive_id']}/items/{cli['item_id']}"
     
+    # 2. Fallback para o EXCEL_PATH global
     if EXCEL_PATH:
         return EXCEL_PATH
 
@@ -272,6 +283,7 @@ def excel_add_row(values: List, chat_id: str):
     if len(values) != 8:
         raise RuntimeError(f"Esperava 8 colunas, recebi {len(values)}.")
 
+    # Busca o caminho da planilha CORRETA para este chat_id
     excel_path = excel_path_for_chat(chat_id)
     token = msal_token()
     url = _build_workbook_rows_add_url(excel_path)
@@ -283,7 +295,7 @@ def excel_add_row(values: List, chat_id: str):
     return r.json()
 
 # =========================================================
-# NLP e Parsers (sem alterações)
+# NLP e Parsers (mantidos)
 # =========================================================
 def parse_money(text: str) -> Optional[float]:
     m = re.search(r"(\d{1,3}(?:\.\d{3})*(?:,\d{2})|\d+(?:\.\d{2})?)", text)
@@ -297,18 +309,15 @@ def parse_money(text: str) -> Optional[float]:
 def parse_date(text: str) -> Optional[str]:
     t = text.lower()
     today = datetime.now().date()
-    if "hoje" in t:
-        return today.strftime("%Y-%m-%d")
-    if "ontem" in t:
-        return (today - timedelta(days=1)).strftime("%Y-%m-%d")
+    if "hoje" in t: return today.strftime("%Y-%m-%d")
+    if "ontem" in t: return (today - timedelta(days=1)).strftime("%Y-%m-%d")
     m = re.search(r"\b(\d{1,2})/(\d{1,2})(?:/(\d{4}))?\b", text)
     if m:
         d, mo, y = m.group(1), m.group(2), m.group(3) or str(today.year)
         try:
             dt = datetime.strptime(f"{d}/{mo}/{y}", "%d/%m/%Y").date()
             return dt.strftime("%Y-%m-%d")
-        except:
-            return None
+        except: return None
     return None
 
 def detect_payment(text: str) -> str:
@@ -404,20 +413,34 @@ async def telegram_webhook(req: Request):
     if not chat_id or not text:
         return {"ok": True}
 
-    # ===== [ADMIN] comandos de licença =====
-    if ADMIN_TELEGRAM_ID and str(chat_id) == str(ADMIN_TELEGRAM_ID):
+    # CONVERTE chat_id para string para comparação com ENVs
+    chat_id_str = str(chat_id)
+
+    # ===== [ADMIN] comandos de licença (REFORÇADO) =====
+    if ADMIN_TELEGRAM_ID and chat_id_str == ADMIN_TELEGRAM_ID:
         low = text.lower()
+        
         if low.startswith("/licenca nova"):
             try:
-                days = int(text.split()[2]) if len(text.split()) >= 3 else 30
+                # Tenta extrair dias, default para 30
+                parts = text.split()
+                days = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else 30
             except:
                 days = 30
+                
             key, exp = create_license(days=None if days == 0 else days)
             msg = f"🔑 *Licença criada:*\n`{key}`\n*Validade:* {'vitalícia' if not exp else exp}"
             await tg_send(chat_id, msg)
             return {"ok": True}
-        # ... (outros comandos de admin)
-
+        
+        # Comandos /licenca revogar, /licenca info...
+        # Se você enviar um comando admin que não existe, ele não deve fazer nada, não lançar gasto.
+        
+        # Se for um comando que não reconhecemos no Admin, paramos aqui
+        if low.startswith("/licenca"):
+             await tg_send(chat_id, "Comando de licença não reconhecido ou incompleto.")
+             return {"ok": True}
+        
     # ===== /start (com token de licença) =====
     if text.lower().startswith("/start"):
         record_usage(chat_id, "start")
@@ -435,17 +458,16 @@ async def telegram_webhook(req: Request):
                 await tg_send(chat_id, f"❌ Licença inválida: {err}")
                 return {"ok": True}
 
-            ok2, err2 = bind_license_to_chat(chat_id, token)
+            ok2, err2 = bind_license_to_chat(chat_id_str, token)
             if not ok2:
                 await tg_send(chat_id, f"❌ {err2}")
                 return {"ok": True}
             
             await tg_send(chat_id, "✅ Licença ativada. Configurando sua planilha de lançamentos...")
             
-            # 🚨 NOVO PASSO: Configura a planilha específica do cliente
-            file_ok, file_err = await setup_client_file(str(chat_id))
+            file_ok, file_err = await setup_client_file(chat_id_str)
             if not file_ok:
-                await tg_send(chat_id, f"❌ Erro na configuração da planilha: {file_err}")
+                await tg_send(chat_id, f"❌ Erro na configuração da planilha. Fale com o suporte: {file_err}")
                 return {"ok": True}
             
             await tg_send(chat_id, "🚀 Planilha configurada com sucesso!")
@@ -462,30 +484,25 @@ async def telegram_webhook(req: Request):
 
     # ===== exige licença para qualquer uso (se habilitado) =====
     if LICENSE_ENFORCE:
-        ok, msg = require_active_license(chat_id)
+        ok, msg = require_active_license(chat_id_str)
         if not ok:
             await tg_send(chat_id, f"❗ {msg}")
             return {"ok": True}
 
     # ===== Processamento de Lançamentos (NLP e /add) =====
-    # A partir daqui, o usuário tem licença ativa
-    row, err = None, None
     
-    if text.lower().startswith("/add"):
-        # Lógica para /add (não mostrada para brevidade, mas deve ser inserida aqui se usada)
-        await tg_send(chat_id, "Comando `/add` ainda não implementado nesta versão.")
-        return {"ok": True}
-    else:
-        # NLP livre
-        row, err = parse_natural(text)
+    # 🚨 NOTA: Se você tiver um bloco /add, insira-o aqui. Senão, ele segue para o NLP livre.
+    
+    # NLP livre
+    row, err = parse_natural(text)
 
     if err:
         await tg_send(chat_id, f"❗ {err}")
         return {"ok": True}
 
     try:
-        # 🔑 Lançamento na planilha específica do cliente
-        excel_add_row(row, str(chat_id))
+        # Lançamento na planilha específica do cliente
+        excel_add_row(row, chat_id_str)
         await tg_send(chat_id, "✅ Lançado!")
     except Exception as e:
         await tg_send(chat_id, f"❌ Erro ao lançar na planilha: {e}")
