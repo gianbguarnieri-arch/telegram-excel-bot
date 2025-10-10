@@ -1,4 +1,6 @@
-# app.py — Bot de Lançamentos com Licenciamento por chat_id + e-mail
+# app.py — Bot de Lançamentos com Licenciamento (chat_id + e-mail),
+# cópia no SharePoint/OneDrive, e envio por e-mail do link da planilha.
+
 import os
 import re
 import json
@@ -50,7 +52,6 @@ SQLITE_PATH = os.getenv("SQLITE_PATH", "/tmp/db.sqlite")
 LICENSE_ENFORCE = os.getenv("LICENSE_ENFORCE", "1") == "1"
 
 def _db():
-    # isolation_level=None permite PRAGMA e DDL atomizados; aqui mantemos default e commit manual
     return sqlite3.connect(SQLITE_PATH)
 
 def licenses_db_init():
@@ -77,7 +78,7 @@ def licenses_db_init():
             email TEXT,
             FOREIGN KEY (license_key) REFERENCES licenses(license_key)
         )""")
-        # Migrações leves (ignora erro se a coluna já existir)
+        # Migração leve: garantir coluna email
         try:
             con.execute("ALTER TABLE clients ADD COLUMN email TEXT")
         except Exception:
@@ -94,7 +95,6 @@ def licenses_db_init():
 
 @app.on_event("startup")
 def _on_startup():
-    # Garantir DB pronto em cada boot (idempotente)
     licenses_db_init()
 
 def _now_iso():
@@ -155,7 +155,6 @@ def bind_license_to_chat(chat_id: str, license_key: str):
                           (license_key, str(chat_id)))
         if cur.fetchone():
             return False, "Essa licença já foi usada por outro Telegram."
-
         con.execute("INSERT OR IGNORE INTO clients(chat_id, created_at) VALUES(?,?)",
                     (str(chat_id), _now_iso()))
         con.execute("UPDATE clients SET license_key=?, last_seen_at=? WHERE chat_id=?",
@@ -262,16 +261,16 @@ async def _graph_copy_file(template_item_id: str, drive_id: str, dest_folder_id:
 
     location = r.headers.get("Location")
     if location:
-        # Poll até 12s
+        # Poll até ~12s
         async with httpx.AsyncClient(timeout=12) as client:
             for _ in range(10):
                 await asyncio.sleep(1.2)
                 pr = await client.get(location, headers={"Authorization": f"Bearer {token}"})
                 if pr.status_code == 200:
                     data = pr.json()
-                    # Alguns tenants retornam 'id'; outros, 'resourceId'
                     return data.get("id") or data.get("resourceId") or data.get("itemId")
-    # Fallback por children filtrando por nome (escapando aspas simples)
+
+    # Fallback por children (escapando aspas simples)
     await asyncio.sleep(3)
     safe_name = new_file_name.replace("'", "''")
     search_url = f"{GRAPH_BASE}/drives/{drive_id}/items/{dest_folder_id}/children?$filter=name eq '{safe_name}'"
@@ -329,8 +328,59 @@ def excel_add_row(values: List, chat_id: str):
         raise RuntimeError(f"Graph error {r.status_code}: {r.text}")
     return r.json()
 
+# ====== EMAIL / SHARE-LINK HELPERS (GRAPH) ======
+EMAIL_SEND_ENABLED = os.getenv("EMAIL_SEND_ENABLED", "0") == "1"
+MAIL_SENDER_UPN = os.getenv("MAIL_SENDER_UPN")            # ex.: suporte@seudominio.com
+MAIL_SENDER_USER_ID = os.getenv("MAIL_SENDER_USER_ID")    # GUID opcional
+SHARE_LINK_TYPE = os.getenv("SHARE_LINK_TYPE", "view")    # "view" ou "edit"
+SHARE_LINK_SCOPE = os.getenv("SHARE_LINK_SCOPE", "anonymous")  # "anonymous" ou "organization"
+
+def graph_create_share_link(drive_id: str, item_id: str, link_type: str = None, scope: str = None) -> str:
+    """
+    Cria link de compartilhamento para um item (planilha do cliente).
+    Retorna a URL do link (string).
+    """
+    token = msal_token()
+    url = f"{GRAPH_BASE}/drives/{drive_id}/items/{item_id}/createLink"
+    payload = {
+        "type": (link_type or SHARE_LINK_TYPE),
+        "scope": (scope or SHARE_LINK_SCOPE),
+    }
+    r = requests.post(url, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                      json=payload, timeout=20)
+    if r.status_code >= 300:
+        raise RuntimeError(f"createLink error {r.status_code}: {r.text}")
+    data = r.json()
+    return (data.get("link") or {}).get("webUrl") or (data.get("link") or {}).get("url")
+
+def graph_send_mail(to_email: str, subject: str, html_body: str):
+    """
+    Envia e-mail usando permissões de aplicativo (application) no Graph.
+    Requer Mail.Send (application) + permissão para enviar como o usuário/mailbox configurado.
+    """
+    if not (MAIL_SENDER_UPN or MAIL_SENDER_USER_ID):
+        raise RuntimeError("Configure MAIL_SENDER_UPN ou MAIL_SENDER_USER_ID para enviar e-mail.")
+
+    token = msal_token()
+    sender_path = MAIL_SENDER_USER_ID or MAIL_SENDER_UPN
+    send_url = f"{GRAPH_BASE}/users/{sender_path}/sendMail"
+
+    msg = {
+        "message": {
+            "subject": subject,
+            "body": {"contentType": "HTML", "content": html_body},
+            "toRecipients": [{"emailAddress": {"address": to_email}}],
+        },
+        "saveToSentItems": True
+    }
+    r = requests.post(send_url,
+                      headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                      json=msg, timeout=20)
+    if r.status_code not in (202, 200):
+        raise RuntimeError(f"sendMail error {r.status_code}: {r.text}")
+
 # =========================================================
-# NLP e Parsers (mantidos)
+# NLP e Parsers
 # =========================================================
 def parse_money(text: str) -> Optional[float]:
     m = re.search(r"(\d{1,3}(?:\.\d{3})*(?:,\d{2})|\d+(?:\.\d{2})?)", text)
@@ -534,6 +584,31 @@ async def telegram_webhook(req: Request):
                 return {"ok": True}
 
             await tg_send(chat_id, "🚀 Planilha configurada com sucesso!")
+
+            # ===== Envio de e-mail automático com link da planilha =====
+            try:
+                if EMAIL_SEND_ENABLED:
+                    cli = get_client(chat_id_str)
+                    to_email = cli.get("email") if cli else None
+                    drive_id = cli.get("drive_id") if cli else None
+                    item_id  = cli.get("item_id") if cli else None
+
+                    if to_email and drive_id and item_id:
+                        share_url = graph_create_share_link(drive_id, item_id, SHARE_LINK_TYPE, SHARE_LINK_SCOPE)
+                        subj = "Sua planilha de lançamentos está pronta"
+                        html = f"""
+                        <p>Olá!</p>
+                        <p>Sua planilha foi criada com sucesso. Você pode acessar pelo link abaixo:</p>
+                        <p><a href="{share_url}">{share_url}</a></p>
+                        <p>Qualquer dúvida, é só responder este e-mail.</p>
+                        """
+                        graph_send_mail(to_email, subj, html)
+                        await tg_send(chat_id, f"✉️ E-mail enviado para {to_email}")
+                    else:
+                        await tg_send(chat_id, "ℹ️ Não consegui enviar e-mail (faltam email/drive/item). Mas a planilha foi criada.")
+            except Exception as e:
+                # não bloqueia o fluxo se o e-mail falhar
+                await tg_send(chat_id, f"⚠️ Planilha criada, mas falhou enviar e-mail: {e}")
 
         reply = (
             "Pode me contar seus gastos/recebimentos em linguagem natural.\n"
