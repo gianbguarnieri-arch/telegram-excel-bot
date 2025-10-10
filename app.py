@@ -31,7 +31,7 @@ CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
 # === Excel destino ===
-EXCEL_PATH = os.getenv("EXCEL_PATH")  # Fallback global se não houver arquivo específico por cliente
+EXCEL_PATH = os.getenv("EXCEL_PATH")
 WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "Plan1")
 TABLE_NAME = os.getenv("TABLE_NAME", "Lancamentos")
 
@@ -43,45 +43,54 @@ DEST_FOLDER_ITEM_ID = os.getenv("DEST_FOLDER_ITEM_ID")
 # =========================================================
 # [LICENÇAS] ENVs / DB
 # =========================================================
-# IMPORTANTE: Carregamos o ADMIN_TELEGRAM_ID como string para evitar problemas de tipo
 ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID")
-SQLITE_PATH = os.getenv("SQLITE_PATH", "/data/db.sqlite")
+# NOTA: O caminho deve ser /tmp/db.sqlite no Render Free
+SQLITE_PATH = os.getenv("SQLITE_PATH", "/tmp/db.sqlite")
 LICENSE_ENFORCE = os.getenv("LICENSE_ENFORCE", "1") == "1"
 
 def _db():
     return sqlite3.connect(SQLITE_PATH)
 
 def licenses_db_init():
-    con = _db()
-    con.execute("""
-    CREATE TABLE IF NOT EXISTS licenses (
-        license_key TEXT PRIMARY KEY,
-        status TEXT NOT NULL DEFAULT 'active',  -- active | revoked | expired
-        max_files INTEGER NOT NULL DEFAULT 1,
-        expires_at TEXT,                         -- ISO8601 ou NULL (vitalícia)
-        notes TEXT
-    )""")
-    con.execute("""
-    CREATE TABLE IF NOT EXISTS clients (
-        chat_id TEXT PRIMARY KEY,
-        license_key TEXT,
-        file_scope TEXT,      -- 'drive' (seu SharePoint) | 'me' (futuro per-user)
-        drive_id TEXT,        -- se 'drive': DRIVE_ID; se 'me': vazio (futuro)
-        item_id TEXT,         -- item da planilha do cliente
-        created_at TEXT,
-        last_seen_at TEXT,
-        FOREIGN KEY (license_key) REFERENCES licenses(license_key)
-    )""")
-    con.execute("""
-    CREATE TABLE IF NOT EXISTS usage (
-        chat_id TEXT,
-        event TEXT,
-        ts TEXT
-    )""")
-    con.commit()
-    con.close()
+    """Inicializa as tabelas do SQLite. Chamar APENAS uma vez."""
+    print(f"INFO: Tentando inicializar DB em {SQLITE_PATH}")
+    try:
+        con = _db()
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS licenses (
+            license_key TEXT PRIMARY KEY,
+            status TEXT NOT NULL DEFAULT 'active',
+            max_files INTEGER NOT NULL DEFAULT 1,
+            expires_at TEXT,
+            notes TEXT
+        )""")
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS clients (
+            chat_id TEXT PRIMARY KEY,
+            license_key TEXT,
+            file_scope TEXT,
+            drive_id TEXT,
+            item_id TEXT,
+            created_at TEXT,
+            last_seen_at TEXT,
+            FOREIGN KEY (license_key) REFERENCES licenses(license_key)
+        )""")
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS usage (
+            chat_id TEXT,
+            event TEXT,
+            ts TEXT
+        )""")
+        con.commit()
+        con.close()
+        print("INFO: Tabelas criadas com sucesso.")
+    except Exception as e:
+        print(f"ERRO FATAL ao inicializar o DB: {e}")
+        # Lança o erro novamente para que o deploy falhe, se for o caso
+        raise
 
-licenses_db_init()
+# A CHAMA AUTOMÁTICA FOI REMOVIDA DAQUI. VOCÊ DEVE EXECUTAR licenses_db_init()
+# manualmente APENAS UMA VEZ no console do Render.
 
 def _now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -158,8 +167,8 @@ def get_client(chat_id: str):
 
 def set_client_file(chat_id: str, file_scope: str, drive_id: Optional[str], item_id: str):
     con = _db()
-    con.execute("""UPDATE clients SET file_scope=?, drive_id=?, item_id=?, last_seen_at=? WHERE chat_id=?
-                   """, (file_scope, drive_id, item_id, _now_iso(), str(chat_id)))
+    con.execute("""UPDATE clients SET file_scope=?, drive_id=?, item_id=?, last_seen_at=? WHERE chat_id=?""",
+                (file_scope, drive_id, item_id, _now_iso(), str(chat_id)))
     con.commit(); con.close()
 
 def require_active_license(chat_id: str):
@@ -200,7 +209,7 @@ def msal_token():
         raise RuntimeError(f"MSAL error: {result}")
     return result["access_token"]
 
-# 🔑 NOVAS FUNÇÕES: Cópia e Configuração de Arquivo por Cliente
+# NOVAS FUNÇÕES: Cópia e Configuração de Arquivo por Cliente
 async def _graph_copy_file(template_item_id: str, drive_id: str, dest_folder_id: str, new_file_name: str) -> Optional[str]:
     """Copia o arquivo modelo e retorna o ID do novo arquivo (item_id)."""
     if not all([template_item_id, drive_id, dest_folder_id]):
@@ -216,7 +225,6 @@ async def _graph_copy_file(template_item_id: str, drive_id: str, dest_folder_id:
     if r.status_code != 202:
         raise RuntimeError(f"Erro ao iniciar cópia do template. Código: {r.status_code}, Detalhe: {r.text}")
 
-    # Espera 5 segundos e tenta buscar o item pelo nome (simplificação)
     await asyncio.sleep(5)
     search_url = f"{GRAPH_BASE}/drives/{drive_id}/items/{dest_folder_id}/children"
     
@@ -240,7 +248,7 @@ async def setup_client_file(chat_id: str) -> Tuple[bool, Optional[str]]:
     """Cria o arquivo de lançamento para o cliente e vincula ao chat_id."""
     cli = get_client(chat_id)
     if cli and cli["item_id"]:
-        return True, None # Arquivo já configurado
+        return True, None
 
     new_file_name = f"Lancamentos - {chat_id}.xlsx"
     try:
@@ -255,8 +263,6 @@ async def setup_client_file(chat_id: str) -> Tuple[bool, Optional[str]]:
     return True, None
 
 
-# 🔑 FUNÇÕES DE ACESSO AO EXCEL ATUALIZADAS PARA O CLIENTE
-
 def _build_workbook_rows_add_url(excel_path: str) -> str:
     if "/drive/items/" in excel_path:
         return f"{GRAPH_BASE}{excel_path}/workbook/worksheets('{WORKSHEET_NAME}')/tables('{TABLE_NAME}')/rows/add"
@@ -268,11 +274,9 @@ def excel_path_for_chat(chat_id: str) -> str:
     """Busca o caminho da planilha do cliente ou retorna o caminho global."""
     cli = get_client(chat_id)
     
-    # 1. Tenta usar a planilha específica do cliente (item_id do DB)
     if cli and cli.get("item_id") and cli.get("drive_id"):
         return f"/drives/{cli['drive_id']}/items/{cli['item_id']}"
     
-    # 2. Fallback para o EXCEL_PATH global
     if EXCEL_PATH:
         return EXCEL_PATH
 
@@ -283,7 +287,6 @@ def excel_add_row(values: List, chat_id: str):
     if len(values) != 8:
         raise RuntimeError(f"Esperava 8 colunas, recebi {len(values)}.")
 
-    # Busca o caminho da planilha CORRETA para este chat_id
     excel_path = excel_path_for_chat(chat_id)
     token = msal_token()
     url = _build_workbook_rows_add_url(excel_path)
@@ -413,16 +416,15 @@ async def telegram_webhook(req: Request):
     if not chat_id or not text:
         return {"ok": True}
 
-    # CONVERTE chat_id para string para comparação com ENVs
     chat_id_str = str(chat_id)
 
     # ===== [ADMIN] comandos de licença (REFORÇADO) =====
+    # Verifica se o chat_id é igual ao ID do administrador
     if ADMIN_TELEGRAM_ID and chat_id_str == ADMIN_TELEGRAM_ID:
         low = text.lower()
         
         if low.startswith("/licenca nova"):
             try:
-                # Tenta extrair dias, default para 30
                 parts = text.split()
                 days = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else 30
             except:
@@ -433,10 +435,12 @@ async def telegram_webhook(req: Request):
             await tg_send(chat_id, msg)
             return {"ok": True}
         
-        # Comandos /licenca revogar, /licenca info...
-        # Se você enviar um comando admin que não existe, ele não deve fazer nada, não lançar gasto.
+        # O comando /licenca info pode ser útil aqui para depuração
+        if low.startswith("/licenca info"):
+            await tg_send(chat_id, f"Seu ADMIN ID ({chat_id_str}) está correto. O bot está ativo.")
+            return {"ok": True}
         
-        # Se for um comando que não reconhecemos no Admin, paramos aqui
+        # Se for um comando de administração, bloqueamos o fluxo de lançamento
         if low.startswith("/licenca"):
              await tg_send(chat_id, "Comando de licença não reconhecido ou incompleto.")
              return {"ok": True}
@@ -489,11 +493,7 @@ async def telegram_webhook(req: Request):
             await tg_send(chat_id, f"❗ {msg}")
             return {"ok": True}
 
-    # ===== Processamento de Lançamentos (NLP e /add) =====
-    
-    # 🚨 NOTA: Se você tiver um bloco /add, insira-o aqui. Senão, ele segue para o NLP livre.
-    
-    # NLP livre
+    # ===== Processamento de Lançamentos (NLP) =====
     row, err = parse_natural(text)
 
     if err:
