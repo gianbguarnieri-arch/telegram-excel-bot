@@ -1,520 +1,559 @@
-# app.py
 import os
 import re
 import json
-import time
-import asyncio
-from datetime import datetime, date
-from typing import Any, Dict, List, Optional, Tuple
+import sqlite3
+import secrets
+import string
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Tuple, List
 
+import requests
 import httpx
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+import msal
+from fastapi import FastAPI, Request
 
-# ---------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------
-TENANT_ID = os.getenv("TENANT_ID", "").strip()
-CLIENT_ID = os.getenv("CLIENT_ID", "").strip()
-CLIENT_SECRET = os.getenv("CLIENT_SECRET", "").strip()
+# =========================================================
+# FastAPI
+# =========================================================
+app = FastAPI()
 
-DRIVE_ID = os.getenv("DRIVE_ID", "").strip()
-TEMPLATE_ITEM_ID = os.getenv("TEMPLATE_ITEM_ID", "").strip()
-DEST_FOLDER_ITEM_ID = os.getenv("DEST_FOLDER_ITEM_ID", "").strip()
+# =========================================================
+# ENVs (Telegram + Graph app-only)
+# =========================================================
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
-CLIENTS_TABLE_PATH = os.getenv("CLIENTS_TABLE_PATH", "").strip()
-CLIENTS_TABLE_NAME = os.getenv("CLIENTS_TABLE_NAME", "Clientes").strip()
-CLIENTS_WORKSHEET_NAME = os.getenv("CLIENTS_WORKSHEET_NAME", "Plan1").strip()
-
-TABLE_NAME = os.getenv("TABLE_NAME", "Lancamentos").strip()
-WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "Plan1").strip()
-
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-DEBUG = os.getenv("DEBUG", "0").strip() in ("1", "true", "True", "yes")
+TENANT_ID = os.getenv("TENANT_ID")
+CLIENT_ID = os.getenv("CLIENT_ID")
+CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
-app = FastAPI(title="telegram-excel-bot", version="2.0")
+# === Excel destino ===
+# Forma 1 (global): use EXCEL_PATH (funciona agora)
+#   - exemplo por caminho: /users/.../drive/root:/Planilhas/Lancamentos.xlsx
+#   - exemplo por ID:      /users/.../drive/items/01ABCD...
+EXCEL_PATH = os.getenv("EXCEL_PATH")  # fallback global se não houver arquivo específico por cliente
+WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "Plan1")
+TABLE_NAME = os.getenv("TABLE_NAME", "Lancamentos")
 
+# (Opcional) Estrutura por Drive/Item (para quem já usa IDs em site/SharePoint)
+DRIVE_ID = os.getenv("DRIVE_ID")  # ex.: b!_GPz2s5...
+# item_id por cliente será salvo no SQLite (clients.item_id)
 
-def log(*args):
-    if DEBUG:
-        print("[DEBUG]", *args)
+# =========================================================
+# [LICENÇAS] ENVs / DB
+# =========================================================
+ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID")  # seu chat id (número)
+SQLITE_PATH = os.getenv("SQLITE_PATH", "/data/db.sqlite")  # use um Disk no Render pra persistir
+LICENSE_ENFORCE = os.getenv("LICENSE_ENFORCE", "1") == "1"  # exige licença no /start e /add
 
+def _db():
+    return sqlite3.connect(SQLITE_PATH)
 
-# ---------------------------------------------------------------------
-# Auth (corrige invalidAudienceUri)
-# ---------------------------------------------------------------------
-_access_token_cache: Tuple[float, str] = (0.0, "")
+def licenses_db_init():
+    con = _db()
+    con.execute("""
+    CREATE TABLE IF NOT EXISTS licenses (
+        license_key TEXT PRIMARY KEY,
+        status TEXT NOT NULL DEFAULT 'active',  -- active | revoked | expired
+        max_files INTEGER NOT NULL DEFAULT 1,
+        expires_at TEXT,                        -- ISO8601 ou NULL (vitalícia)
+        notes TEXT
+    )""")
+    con.execute("""
+    CREATE TABLE IF NOT EXISTS clients (
+        chat_id TEXT PRIMARY KEY,
+        license_key TEXT,
+        file_scope TEXT,        -- 'drive' (seu SharePoint) | 'me' (futuro per-user)
+        drive_id TEXT,          -- se 'drive': DRIVE_ID; se 'me': vazio (futuro)
+        item_id TEXT,           -- item da planilha do cliente
+        created_at TEXT,
+        last_seen_at TEXT,
+        FOREIGN KEY (license_key) REFERENCES licenses(license_key)
+    )""")
+    con.execute("""
+    CREATE TABLE IF NOT EXISTS usage (
+        chat_id TEXT,
+        event TEXT,
+        ts TEXT
+    )""")
+    con.commit()
+    con.close()
 
-async def get_access_token() -> str:
-    """
-    Client Credentials com scope '.default' (corrige invalidAudienceUri).
-    """
-    global _access_token_cache
-    now = time.time()
-    exp, token = _access_token_cache
-    if token and now < exp:
-        return token
+licenses_db_init()
 
-    url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
-    data = {
-        "client_id": CLIENT_ID,
-        "client_secret": CLIENT_SECRET,
-        "grant_type": "client_credentials",
-        "scope": "https://graph.microsoft.com/.default",
-    }
-    async with httpx.AsyncClient(timeout=40) as cli:
-        r = await cli.post(url, data=data)
-    if r.status_code != 200:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Token error {r.status_code}: {r.text}"
+def _now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+def record_usage(chat_id, event):
+    con = _db()
+    con.execute("INSERT INTO usage(chat_id, event, ts) VALUES(?,?,?)",
+                (str(chat_id), event, _now_iso()))
+    con.commit(); con.close()
+
+def _gen_key(prefix="GF"):
+    alphabet = string.ascii_uppercase + string.digits
+    part = lambda n: "".join(secrets.choice(alphabet) for _ in range(n))
+    return f"{prefix}-{part(4)}-{part(4)}"
+
+def create_license(days: int|None = 30, max_files: int = 1, notes: str|None=None):
+    key = _gen_key()
+    expires_at = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat(timespec="seconds") if days else None
+    con = _db()
+    con.execute("INSERT INTO licenses(license_key,status,max_files,expires_at,notes) VALUES(?,?,?,?,?)",
+                (key, "active", max_files, expires_at, notes))
+    con.commit(); con.close()
+    return key, expires_at
+
+def get_license(license_key: str):
+    con = _db()
+    cur = con.execute("SELECT license_key,status,max_files,expires_at,notes FROM licenses WHERE license_key=?",
+                      (license_key,))
+    row = cur.fetchone()
+    con.close()
+    if not row: return None
+    return {"license_key": row[0], "status": row[1], "max_files": row[2], "expires_at": row[3], "notes": row[4]}
+
+def is_license_valid(lic: dict):
+    if not lic: return False, "Licença não encontrada."
+    if lic["status"] != "active": return False, "Licença não está ativa."
+    if lic["expires_at"]:
+        try:
+            if datetime.now(timezone.utc) > datetime.fromisoformat(lic["expires_at"]):
+                return False, "Licença expirada."
+        except Exception:
+            return False, "Validade da licença inválida."
+    return True, None
+
+def bind_license_to_chat(chat_id: str, license_key: str):
+    con = _db()
+    # bloqueia reuso em outro chat
+    cur = con.execute("SELECT chat_id FROM clients WHERE license_key=? AND chat_id<>? LIMIT 1",
+                      (license_key, str(chat_id)))
+    conflict = cur.fetchone()
+    if conflict:
+        con.close()
+        return False, "Essa licença já foi usada por outro Telegram."
+
+    con.execute("""
+        INSERT INTO clients(chat_id, license_key, created_at, last_seen_at)
+        VALUES(?,?,?,?,)
+    """.replace("?,?,?,?,", "?,?,?,?"),
+        (str(chat_id), license_key, _now_iso(), _now_iso())
+    )
+    # upsert se já existia
+    con.execute("""
+        UPDATE clients SET license_key=?, last_seen_at=? WHERE chat_id=?
+    """, (license_key, _now_iso(), str(chat_id)))
+    con.commit(); con.close()
+    return True, None
+
+def get_client(chat_id: str):
+    con = _db()
+    cur = con.execute("""SELECT chat_id, license_key, file_scope, drive_id, item_id, created_at, last_seen_at
+                         FROM clients WHERE chat_id=?""", (str(chat_id),))
+    row = cur.fetchone()
+    con.close()
+    if not row: return None
+    return {"chat_id": row[0], "license_key": row[1], "file_scope": row[2], "drive_id": row[3],
+            "item_id": row[4], "created_at": row[5], "last_seen_at": row[6]}
+
+def set_client_file(chat_id: str, file_scope: str, drive_id: Optional[str], item_id: str):
+    con = _db()
+    con.execute("""UPDATE clients SET file_scope=?, drive_id=?, item_id=?, last_seen_at=? WHERE chat_id=?""",
+                (file_scope, drive_id, item_id, _now_iso(), str(chat_id)))
+    con.commit(); con.close()
+
+def require_active_license(chat_id: str):
+    cli = get_client(chat_id)
+    if not cli:
+        return False, "Para usar o bot você precisa **ativar sua licença**. Envie /start SEU-CÓDIGO (ex.: /start GF-ABCD-1234)."
+    lic = get_license(cli["license_key"]) if cli["license_key"] else None
+    ok, err = is_license_valid(lic)
+    if not ok:
+        return False, f"Licença inválida: {err}\nFale com o suporte para renovar/ativar."
+    return True, None
+
+# =========================================================
+# Telegram helper
+# =========================================================
+async def tg_send(chat_id, text):
+    async with httpx.AsyncClient(timeout=12) as client:
+        await client.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": chat_id, "text": text},
         )
-    tok = r.json()
-    access_token = tok["access_token"]
-    expires_in = int(tok.get("expires_in", 3599))
-    _access_token_cache = (now + expires_in - 60, access_token)
-    return access_token
 
+# =========================================================
+# MSAL (app-only) + Graph helpers
+# =========================================================
+SCOPE = ["https://graph.microsoft.com/.default"]
 
-async def graph(method: str, path: str, **kwargs) -> httpx.Response:
-    """
-    Chamada Graph com Bearer; path deve ser relativo a /v1.0 (ex.: '/drives/{id}/items/...').
-    """
-    token = await get_access_token()
-    url = f"{GRAPH_BASE}{path}"
-    headers = kwargs.pop("headers", {})
-    headers["Authorization"] = f"Bearer {token}"
-    headers.setdefault("Content-Type", "application/json")
-    async with httpx.AsyncClient(timeout=60) as cli:
-        resp = await cli.request(method, url, headers=headers, **kwargs)
-    return resp
+def msal_token():
+    app_msal = msal.ConfidentialClientApplication(
+        client_id=CLIENT_ID,
+        client_credential=CLIENT_SECRET,
+        authority=f"https://login.microsoftonline.com/{TENANT_ID}",
+    )
+    result = app_msal.acquire_token_silent(SCOPE, account=None)
+    if not result:
+        result = app_msal.acquire_token_for_client(scopes=SCOPE)
+    if "access_token" not in result:
+        raise RuntimeError(f"MSAL error: {result}")
+    return result["access_token"]
 
+def _build_workbook_rows_add_url(excel_path: str) -> str:
+    # aceita /drive/items/{id} OU /drive/root:/...xlsx
+    if "/drive/items/" in excel_path:
+        # por ID (sem ':')
+        return (
+            f"{GRAPH_BASE}{excel_path}"
+            f"/workbook/worksheets('{WORKSHEET_NAME}')/tables('{TABLE_NAME}')/rows/add"
+        )
+    else:
+        # por caminho (com ':')
+        return (
+            f"{GRAPH_BASE}{excel_path}"
+            f":/workbook/worksheets('{WORKSHEET_NAME}')/tables('{TABLE_NAME}')/rows/add"
+        )
 
-# ---------------------------------------------------------------------
-# Utilitários Graph / Excel
-# ---------------------------------------------------------------------
-def extract_item_root_from_clients_path() -> str:
-    """
-    De CLIENTS_TABLE_PATH (que aponta para workbook, p.ex. '/drives/{driveId}/items/{itemId}')
-    devolve o prefixo '/drives/.../items/{itemId}' sem o sufixo '/workbook...'
-    para lermos metadata do arquivo.
-    """
-    p = CLIENTS_TABLE_PATH.strip()
-    # comum: '/users/.../drive/items/{id}' ou '/drives/{driveId}/items/{id}'
-    # se já terminar com '/items/{id}', devolve; se tiver '/workbook', corta antes.
-    if "/workbook" in p:
-        p = p.split("/workbook")[0]
-    return p
+def excel_add_row(values: List):
+    """Insere uma linha (8 colunas) na tabela 'Lancamentos'."""
+    if len(values) != 8:
+        raise RuntimeError(f"Esperava 8 colunas, recebi {len(values)}.")
+    # escolhe o caminho do arquivo:
+    excel_path = excel_path_for_chat(values[-1] if False else None)  # não usado; manter assinatura
+    # acima, mantemos o EXCEL_PATH global por simplicidade:
+    if not EXCEL_PATH:
+        raise RuntimeError("Caminho do Excel não definido (EXCEL_PATH).")
 
-
-async def graph_get_json(path: str) -> Dict[str, Any]:
-    r = await graph("GET", path)
-    if r.status_code >= 400:
-        raise HTTPException(status_code=r.status_code, detail=r.text)
+    token = msal_token()
+    url = _build_workbook_rows_add_url(EXCEL_PATH)
+    r = requests.post(
+        url,
+        headers={"Authorization": f"Bearer {token}"},
+        json={"values": [values]},
+        timeout=25
+    )
+    if r.status_code >= 300:
+        raise RuntimeError(f"Graph error {r.status_code}: {r.text}")
     return r.json()
 
-
-async def ensure_clients_sheet_ok() -> Dict[str, Any]:
+def excel_path_for_chat(_unused=None):
     """
-    Checa se a Clients.xlsx é acessível. Usa CLIENTS_TABLE_PATH como base.
+    Futuro: procurar no SQLite se o cliente tem item_id específico.
+    Hoje: usa EXCEL_PATH global (sua planilha).
     """
-    root = extract_item_root_from_clients_path()
-    r = await graph("GET", root)
-    return {"status": r.status_code, "ok": r.status_code == 200}
+    if not EXCEL_PATH:
+        raise RuntimeError("EXCEL_PATH não definido.")
+    return EXCEL_PATH
 
+# =========================================================
+# NLP simples (PT-BR) → 8 colunas
+# =========================================================
+def parse_money(text: str) -> Optional[float]:
+    # captura 123,45 / 1.234,56 / 123.45 / 123
+    m = re.search(r"(\d{1,3}(?:\.\d{3})*(?:,\d{2})|\d+(?:\.\d{2})?)", text)
+    if not m: return None
+    val = m.group(1).replace(".", "").replace(",", ".")
+    try:
+        return float(val)
+    except:
+        return None
 
-async def check_item_exists_by_id(item_id: str) -> Dict[str, Any]:
-    r = await graph("GET", f"/drives/{DRIVE_ID}/items/{item_id}")
-    return {"status": r.status_code, "ok": r.status_code == 200}
-
-
-async def add_row_to_clients(chat_id: str, excel_graph_path: str,
-                             worksheet_name: str, table_name: str) -> None:
-    """
-    Adiciona linha na tabela Clientes (colunas: chat_id, excel_path, worksheet_name, table_name, created_at).
-    """
-    body = {
-        "values": [[
-            chat_id,
-            excel_graph_path,
-            worksheet_name,
-            table_name,
-            datetime.now().strftime("%d/%m/%Y %H:%M")
-        ]]
-    }
-    url = f"{CLIENTS_TABLE_PATH}/workbook/worksheets('{CLIENTS_WORKSHEET_NAME}')/tables('{CLIENTS_TABLE_NAME}')/rows/add"
-    r = await graph("POST", url, content=json.dumps(body))
-    if r.status_code >= 400:
-        raise HTTPException(status_code=r.status_code, detail=r.text)
-
-
-async def get_client_row(chat_id: str) -> Optional[Dict[str, Any]]:
-    """
-    Lê linhas da tabela Clientes e busca chat_id.
-    Retorna dict com colunas se achar; None se não.
-    """
-    url = f"{CLIENTS_TABLE_PATH}/workbook/worksheets('{CLIENTS_WORKSHEET_NAME}')/tables('{CLIENTS_TABLE_NAME}')/rows"
-    r = await graph("GET", url)
-    if r.status_code >= 400:
-        raise HTTPException(status_code=r.status_code, detail=r.text)
-    rows = r.json().get("value", [])
-    for row in rows:
-        vals = row.get("values", [[]])[0]
-        if not vals:
-            continue
-        if str(vals[0]).strip() == str(chat_id):
-            # mapear colunas
-            out = {
-                "chat_id": vals[0],
-                "excel_path": vals[1],
-                "worksheet_name": vals[2],
-                "table_name": vals[3],
-                "created_at": vals[4] if len(vals) > 4 else ""
-            }
-            return out
+def parse_date(text: str) -> Optional[str]:
+    # hoje / ontem / dd/mm/aaaa / dd/mm
+    t = text.lower()
+    today = datetime.now().date()
+    if "hoje" in t:
+        return today.strftime("%Y-%m-%d")
+    if "ontem" in t:
+        return (today - timedelta(days=1)).strftime("%Y-%m-%d")
+    m = re.search(r"\b(\d{1,2})/(\d{1,2})(?:/(\d{4}))?\b", text)
+    if m:
+        d, mo, y = m.group(1), m.group(2), m.group(3) or str(today.year)
+        try:
+            dt = datetime.strptime(f"{d}/{mo}/{y}", "%d/%m/%Y").date()
+            return dt.strftime("%Y-%m-%d")
+        except:
+            return None
     return None
 
-
-async def copy_template_for_user(file_name: str) -> Dict[str, Any]:
-    """
-    Copia o template usando /copy + monitor (corrige 202/Location).
-    Retorna {item_id, webUrl, graph_path}.
-    """
-    body = {
-        "name": file_name,
-        "parentReference": {
-            "driveId": DRIVE_ID,
-            "id": DEST_FOLDER_ITEM_ID
-        }
-    }
-    path = f"/drives/{DRIVE_ID}/items/{TEMPLATE_ITEM_ID}/copy"
-    r = await graph("POST", path, content=json.dumps(body))
-
-    if r.status_code not in (202, 201, 200):
-        raise HTTPException(status_code=r.status_code, detail=f"Erro ao copiar modelo: {r.text}")
-
-    # Se já veio 201/200, ótimo, pegue Location se houver ou faça um GET por nome.
-    location = r.headers.get("Location")
-    if not location:
-        # Tenta achar por nome dentro da pasta destino
-        # (fallback – raramente necessário; manter simples)
-        await asyncio.sleep(2)
-
-    # Monitora o Location (quando há)
-    if location:
-        async with httpx.AsyncClient(timeout=60) as cli:
-            # usa o mesmo token
-            token = await get_access_token()
-            headers = {"Authorization": f"Bearer {token}"}
-            for _ in range(40):
-                res = await cli.get(location, headers=headers)
-                if res.status_code == 200:
-                    job = res.json()
-                    status = job.get("status")
-                    if status in ("completed", "succeeded", "success"):
-                        resource = job.get("resourceId") or job.get("resource", {}).get("id")
-                        if resource:
-                            item_meta = await graph_get_json(f"/drives/{DRIVE_ID}/items/{resource}")
-                            return {
-                                "item_id": item_meta["id"],
-                                "webUrl": item_meta.get("webUrl", ""),
-                                "graph_path": f"/drives/{DRIVE_ID}/items/{item_meta['id']}"
-                            }
-                        break
-                elif res.status_code in (201, 204):
-                    # alguns tenants retornam 201/204 quando conclui
-                    break
-                await asyncio.sleep(1)
-
-    # Sem Location ou monitor: procura por nome recém criado na pasta de destino
-    children = await graph_get_json(f"/drives/{DRIVE_ID}/items/{DEST_FOLDER_ITEM_ID}/children?$select=id,name,webUrl")
-    for it in children.get("value", []):
-        if it.get("name") == file_name:
-            return {
-                "item_id": it["id"],
-                "webUrl": it.get("webUrl", ""),
-                "graph_path": f"/drives/{DRIVE_ID}/items/{it['id']}"
-            }
-
-    raise HTTPException(status_code=500, detail="Falha ao localizar cópia do modelo (monitor).")
-
-
-async def append_row_to_user_excel(excel_graph_path: str, values: List[Any]) -> None:
-    """
-    Adiciona uma linha na tabela do Excel do cliente.
-    """
-    url = f"{excel_graph_path}/workbook/worksheets('{WORKSHEET_NAME}')/tables('{TABLE_NAME}')/rows/add"
-    body = {"values": [values]}
-    r = await graph("POST", url, content=json.dumps(body))
-    if r.status_code >= 400:
-        raise HTTPException(status_code=r.status_code, detail=r.text)
-
-
-# ---------------------------------------------------------------------
-# Parser simples (linguagem natural)
-# ---------------------------------------------------------------------
-PGTO_MAP = {
-    "pix": "Pix",
-    "cartao": "💳 cartão",
-    "cartão": "💳 cartão",
-    "dinheiro": "Dinheiro",
-    "debito": "Débito",
-    "débito": "Débito",
-    "credito": "Crédito",
-    "crédito": "Crédito",
-    "boleto": "Boleto",
-}
-
-CATEG_MAP = {
-    "mercado": "Mercado",
-    "farmácia": "Farmácia",
-    "farmacia": "Farmácia",
-    "restaurante": "Restaurante",
-    "ifood": "IFood",
-    "combustível": "Combustível",
-    "combustivel": "Combustível",
-    "viagem": "Viagem",
-    "assinatura": "Assinatura",
-    "netflix": "Assinatura",
-    "spotify": "Assinatura",
-}
-
-def parse_pt_br_amount(txt: str) -> Optional[float]:
-    m = re.search(r"(\d{1,3}(?:\.\d{3})*|\d+)(?:[,\.](\d{1,2}))?", txt)
-    if not m:
-        return None
-    inteiro = m.group(1).replace(".", "")
-    frac = m.group(2) or "00"
-    if len(frac) == 1:
-        frac += "0"
-    return float(f"{inteiro}.{frac}")
-
-
-def guess_pgto(txt: str) -> str:
-    txtl = txt.lower()
-    for k, v in PGTO_MAP.items():
-        if k in txtl:
-            return v
-    return "A vista"
-
-
-def guess_categoria(txt: str) -> str:
-    txtl = txt.lower()
-    for k, v in CATEG_MAP.items():
-        if k in txtl:
-            return v
+def detect_payment(text: str) -> str:
+    t = text.lower()
+    # Cartões nomeados
+    m = re.search(r"cart[aã]o\s+([a-z0-9 ]+)", t)
+    if m:
+        brand = m.group(1).strip()
+        brand = re.sub(r"\s+", " ", brand).strip()
+        return f"💳 cartão {brand}"
+    if "pix" in t:
+        return "Pix"
+    if "dinheiro" in t or "cash" in t:
+        return "Dinheiro"
+    if "débito" in t or "debito" in t:
+        return "Débito"
+    if "crédito" in t or "credito" in t:
+        return "💳 cartão"
     return "Outros"
 
-
-def guess_data(txt: str) -> date:
-    # procura dd/mm/aaaa ou dd/mm
-    m = re.search(r"\b(\d{1,2})/(\d{1,2})(?:/(\d{4}))?\b", txt)
+def detect_installments(text: str) -> str:
+    t = text.lower()
+    m = re.search(r"(\d{1,2})x", t)
     if m:
-        d, mth, y = m.group(1), m.group(2), m.group(3)
-        if not y:
-            y = str(datetime.now().year)
-        return date(int(y), int(mth), int(d))
-    if "ontem" in txt.lower():
-        return date.fromordinal(date.today().toordinal() - 1)
-    return date.today()
+        return f"{m.group(1)}x"
+    if "parcelad" in t:
+        return "parcelado"
+    if "à vista" in t or "a vista" in t or "avista" in t:
+        return "à vista"
+    # por padrão, à vista
+    return "à vista"
 
+CATEGORIES = {
+    "Restaurante": ["restaurante", "almoço", "jantar", "lanche", "pizza", "hamburg", "sushi"],
+    "Mercado": ["mercado", "supermercado", "compras de mercado", "rancho", "hortifruti"],
+    "Farmácia": ["farmácia", "remédio", "medicamento", "drogaria"],
+    "Combustível": ["gasolina", "álcool", "etanol", "diesel", "posto", "combustível"],
+    "Ifood": ["ifood", "i-food"],
+    "Passeio em família": ["passeio", "parque", "cinema", "lazer"],
+    "Viagem": ["hotel", "passagem", "viagem", "airbnb"],
+    "Assinatura": ["netflix", "amazon", "disney", "spotify", "premiere"],
+    "Aluguel": ["aluguel", "condomínio"],
+    "Água": ["água", "sabesp"],
+    "Energia": ["energia", "luz", "enel", "cpfl", "cemig"],
+    "Internet": ["internet", "banda larga", "fibra", "vivo", "claro", "oi"],
+    "Plano de Saúde": ["plano de saúde", "unimed", "amil", "bradesco saúde", "hapvida"],
+    "Escola": ["escola", "mensalidade", "faculdade", "curso"],
+    "Imposto": ["iptu", "ipva"],
+    "Financiamento": ["financiamento", "parcela do carro", "parcela da casa"],
+}
 
-def parse_message_freeform(text: str) -> Dict[str, Any]:
+def map_group(category: str) -> str:
+    if category in ["Aluguel","Água","Energia","Internet","Plano de Saúde","Escola","Assinatura"]:
+        return "Gastos Fixos"
+    if category in ["Imposto","Financiamento","Empréstimo"]:
+        return "Despesas Temporárias"
+    if category in ["Mercado","Farmácia","Combustível","Passeio em família","Ifood","Viagem","Restaurante"]:
+        return "Gastos Variáveis"
+    if category in ["Salário","Vale","Renda Extra 1","Renda Extra 2","Pró labore"]:
+        return "Ganhos"
+    if category in ["Renda Fixa","Renda Variável","Fundos imobiliários"]:
+        return "Investimento"
+    if category in ["Trocar de carro","Viagem pra Disney"]:
+        return "Reserva"
+    return "Gastos Variáveis"
+
+def detect_category_and_desc(text: str) -> Tuple[str, Optional[str]]:
+    t = text.lower()
+    for cat, kws in CATEGORIES.items():
+        for kw in kws:
+            if kw in t:
+                # descrição opcional: tenta pegar algo simples após verbo
+                m = re.search(r"(comprei|paguei|gastei)\s+(.*?)(?:\s+na\s+|\s+no\s+|\s+via\s+|$)", t)
+                desc = None
+                if m:
+                    raw = m.group(2)
+                    # tira preço/data das sobras
+                    raw = re.sub(r"\d{1,3}(?:\.\d{3})*(?:,\d{2})|\d+(?:\.\d{2})?", "", raw)
+                    raw = re.sub(r"\b(hoje|ontem|\d{1,2}/\d{1,2}(?:/\d{4})?)\b", "", raw)
+                    raw = raw.strip(" .,-")
+                    if raw and len(raw) < 60:
+                        desc = raw
+                return cat, (desc if desc else None)
+    # fallback
+    return "Outros", None
+
+def parse_natural(text: str) -> Tuple[Optional[List], Optional[str]]:
     """
-    Retorna: {data, tipo, grupo, categoria, descricao, valor, forma_pgto, condicao}
+    Retorna valores (8 colunas) ou erro:
+    [DataISO, Tipo, Grupo, Categoria, Descrição, Valor, FormaPgto, CondiçãoPgto]
     """
-    valor = parse_pt_br_amount(text)
-    data_lanc = guess_data(text)
-    forma = guess_pgto(text)
-    categoria = guess_categoria(text)
-    # heurística simples
-    tipo = "Saída" if "gastei" in text.lower() or "comprei" in text.lower() else "Entrada"
-    grupo = "Gastos Variáveis" if tipo == "Saída" else "Ganhos"
+    valor = parse_money(text)
+    if valor is None:
+        return None, "Não achei o valor. Ex.: 45,90"
 
-    # parcelas
-    condicao = "A vista"
-    parc = re.search(r"(\d+)\s*x", text.lower())
-    if parc:
-        condicao = f"{parc.group(1)}x"
+    data_iso = parse_date(text) or datetime.now().strftime("%Y-%m-%d")
+    forma = detect_payment(text)
+    cond = detect_installments(text)
+    cat, desc = detect_category_and_desc(text)
 
-    # descrição: pega trechos após 'no/na/em' se houver
-    desc = ""
-    md = re.search(r"\bno\s+([^\d]+)", text.lower())
-    if md:
-        desc = md.group(1).strip().title()
-    if not desc:
-        desc = categoria
+    # Tipo: se contiver 'ganhei', 'recebi' => Entrada; senão Saída
+    tipo = "Entrada" if re.search(r"\b(ganhei|recebi|sal[aá]rio|renda)\b", text.lower()) else "Saída"
+    grupo = map_group(cat)
 
-    return {
-        "data": data_lanc.strftime("%d/%m/%Y"),
-        "tipo": tipo,
-        "grupo": grupo,
-        "categoria": categoria,
-        "descricao": desc,
-        "valor": f"{valor:.2f}" if valor is not None else "",
-        "forma_pgto": forma,
-        "condicao": condicao,
-    }
+    return [data_iso, tipo, grupo, cat, (desc or ""), float(valor), forma, cond], None
 
-
-# ---------------------------------------------------------------------
-# Telegram
-# ---------------------------------------------------------------------
-class TgMessage(BaseModel):
-    update_id: Optional[int] = None
-    message: Optional[Dict[str, Any]] = None
-    edited_message: Optional[Dict[str, Any]] = None
-
-
-async def ensure_user_excel(chat_id: str, first_name: str) -> Dict[str, Any]:
-    """
-    Garante que o usuário possua uma planilha. Se existir no Clientes, reaproveita.
-    Se não existir, copia o template e registra.
-    Retorna dict {excel_graph_path, item_id, webUrl}.
-    """
-    # 1) tenta buscar
-    row = await get_client_row(chat_id)
-    if row:
-        return {
-            "excel_graph_path": row["excel_path"],
-            "item_id": row["excel_path"].split("/")[-1],
-            "webUrl": ""  # opcional
-        }
-
-    # 2) copia template
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    file_name = f"Planilha_{first_name}_{ts}.xlsx"
-    info = await copy_template_for_user(file_name)
-
-    # 3) registra no Clientes
-    await add_row_to_clients(
-        chat_id=chat_id,
-        excel_graph_path=info["graph_path"],  # ex.: /drives/{driveId}/items/{itemId}
-        worksheet_name=WORKSHEET_NAME,
-        table_name=TABLE_NAME
-    )
-
-    return {
-        "excel_graph_path": info["graph_path"],
-        "item_id": info["item_id"],
-        "webUrl": info["webUrl"]
-    }
-
-
-async def tg_send(chat_id: str, text: str) -> None:
-    if not TELEGRAM_TOKEN:
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    data = {"chat_id": chat_id, "text": text}
-    async with httpx.AsyncClient(timeout=30) as cli:
-        await cli.post(url, data=data)
-
-
-# ---------------------------------------------------------------------
-# Endpoints
-# ---------------------------------------------------------------------
+# =========================================================
+# Routes
+# =========================================================
 @app.get("/")
-async def root():
+def root():
     return {"status": "ok"}
 
-
 @app.get("/diag")
-async def diag():
-    checks = {
-        "envs": {
-            "DRIVE_ID": bool(DRIVE_ID),
-            "TEMPLATE_ITEM_ID": bool(TEMPLATE_ITEM_ID),
-            "DEST_FOLDER_ITEM_ID": bool(DEST_FOLDER_ITEM_ID),
-            "CLIENTS_TABLE_PATH": bool(CLIENTS_TABLE_PATH),
-        }
+def diag():
+    # diagnóstico simples de envs
+    envs = {
+        "TENANT_ID": bool(TENANT_ID),
+        "CLIENT_ID": bool(CLIENT_ID),
+        "CLIENT_SECRET": bool(CLIENT_SECRET),
+        "TELEGRAM_TOKEN": bool(TELEGRAM_TOKEN),
+        "EXCEL_PATH": bool(EXCEL_PATH),
+        "WORKSHEET_NAME": WORKSHEET_NAME,
+        "TABLE_NAME": TABLE_NAME,
+        "SQLITE_PATH": SQLITE_PATH,
+        "LICENSE_ENFORCE": LICENSE_ENFORCE,
     }
-    # template/dest
-    tpl = await check_item_exists_by_id(TEMPLATE_ITEM_ID) if DRIVE_ID and TEMPLATE_ITEM_ID else {"status": 400, "ok": False}
-    dst = await check_item_exists_by_id(DEST_FOLDER_ITEM_ID) if DRIVE_ID and DEST_FOLDER_ITEM_ID else {"status": 400, "ok": False}
-    cli = await ensure_clients_sheet_ok() if CLIENTS_TABLE_PATH else {"status": 400, "ok": False}
-    checks["template_item"] = tpl
-    checks["dest_folder"] = dst
-    checks["clients_file"] = cli
-    return checks
-
+    # testes básicos
+    checks = {"graph_token": False, "table_ready": False}
+    try:
+        tok = msal_token()
+        checks["graph_token"] = bool(tok)
+        if EXCEL_PATH:
+            url = _build_workbook_rows_add_url(EXCEL_PATH).replace("/rows/add", "")
+            r = requests.get(url, headers={"Authorization": f"Bearer {tok}"}, timeout=15)
+            checks["table_ready"] = r.status_code < 300
+    except Exception:
+        pass
+    return {"envs": envs, "checks": checks}
 
 @app.post("/telegram/webhook")
-async def telegram_webhook(payload: TgMessage):
-    msg = payload.message or payload.edited_message
-    if not msg:
+async def telegram_webhook(req: Request):
+    body = await req.json()
+    message = body.get("message") or {}
+    chat_id = message.get("chat", {}).get("id")
+    text = (message.get("text") or "").strip()
+
+    if not chat_id or not text:
         return {"ok": True}
 
-    chat_id = str(msg["chat"]["id"])
-    text = (msg.get("text") or "").strip()
-    first_name = msg["chat"].get("first_name") or "User"
+    # ===== [ADMIN] comandos de licença =====
+    if ADMIN_TELEGRAM_ID and str(chat_id) == str(ADMIN_TELEGRAM_ID):
+        low = text.lower()
+        if low.startswith("/licenca nova"):
+            try:
+                parts = text.split()
+                days = int(parts[2]) if len(parts) >= 3 else 30
+            except:
+                days = 30
+            key, exp = create_license(days=None if days == 0 else days, max_files=1)
+            msg = f"🔑 Licença criada: {key}\nValidade: {'vitalícia' if not exp else exp}"
+            await tg_send(chat_id, msg); return {"ok": True}
 
-    try:
-        # /start → garante planilha
-        if text.lower().startswith("/start"):
-            info = await ensure_user_excel(chat_id, first_name)
-            await tg_send(chat_id, "Olá! Pode me contar seus gastos/recebimentos em linguagem natural.\n"
-                                    "Exemplos:\n• gastei 45,90 no mercado via cartão hoje\n"
-                                    "• comprei remédio 34 na farmácia via pix\n"
-                                    "• ganhei 800 de salário\n"
-                                    "Se preferir: /add 07/10/2025;Compra;Mercado;Almoço;45,90;Cartão")
+        if low.startswith("/licenca revogar"):
+            parts = text.split()
+            if len(parts) >= 3:
+                key = parts[2].strip()
+                con = _db()
+                con.execute("UPDATE licenses SET status='revoked' WHERE license_key=?", (key,))
+                con.commit(); con.close()
+                await tg_send(chat_id, f"♻️ Licença revogada: {key}")
+            else:
+                await tg_send(chat_id, "Uso: /licenca revogar CHAVE")
             return {"ok": True}
 
-        # /add DD/MM/AAAA;Tipo;Grupo|Categoria;Descricao;Valor;Forma
-        if text.lower().startswith("/add"):
-            try:
-                _, rest = text.split(" ", 1)
-                partes = [p.strip() for p in rest.split(";")]
-                dt, tipo, categoria, descricao, valor, forma = partes[:6]
-                grupo = "Ganhos" if tipo.lower().startswith("ent") else "Gastos Variáveis"
-                cond = "A vista"
-            except Exception:
-                await tg_send(chat_id, "Formato inválido. Use:\n/add 07/10/2025;Compra;Mercado;Almoço;45,90;Cartão")
+        if low.startswith("/licenca info"):
+            parts = text.split()
+            if len(parts) >= 3:
+                key = parts[2].strip()
+                lic = get_license(key)
+                await tg_send(chat_id, f"ℹ️ {lic if lic else 'Não encontrei.'}")
+            else:
+                await tg_send(chat_id, "Uso: /licenca info CHAVE")
+            return {"ok": True}
+
+    # ===== /start (com token de licença) =====
+    if text.lower().startswith("/start"):
+        record_usage(chat_id, "start")
+        parts = text.split(" ", 1)
+        token = parts[1].strip() if len(parts) > 1 else None
+
+        if LICENSE_ENFORCE and not token:
+            await tg_send(chat_id,
+                "Bem-vindo! Para ativar, envie /start SEU-CÓDIGO.\nEx.: /start GF-ABCD-1234")
+            return {"ok": True}
+
+        if token:
+            lic = get_license(token)
+            ok, err = is_license_valid(lic)
+            if not ok:
+                await tg_send(chat_id, f"❌ Licença inválida: {err}")
                 return {"ok": True}
 
-            # Garante excel
-            info = await ensure_user_excel(chat_id, first_name)
-            row = [dt, tipo, grupo, categoria, descricao, valor.replace(",", "."), forma, "A vista"]
-            await append_row_to_user_excel(info["excel_graph_path"], row)
-            await tg_send(chat_id, "Lançado!")
-            return {"ok": True}
+            ok2, err2 = bind_license_to_chat(chat_id, token)
+            if not ok2:
+                await tg_send(chat_id, f"❌ {err2}")
+                return {"ok": True}
 
-        # linguagem natural
-        info = await ensure_user_excel(chat_id, first_name)
-        parsed = parse_message_freeform(text)
-        if not parsed.get("valor"):
-            await tg_send(chat_id, "Não entendi o valor. Ex.: 'gastei 45,90 no mercado via cartão hoje'.")
-            return {"ok": True}
+            await tg_send(chat_id, "✅ Licença ativada com sucesso!")
 
-        row = [
-            parsed["data"],
-            parsed["tipo"],
-            parsed["grupo"],
-            parsed["categoria"],
-            parsed["descricao"],
-            parsed["valor"].replace(",", "."),
-            parsed["forma_pgto"],
-            parsed["condicao"],
-        ]
-        await append_row_to_user_excel(info["excel_graph_path"], row)
-        await tg_send(chat_id, "Lançado!")
+        # sua mensagem de boas-vindas
+        reply = (
+            "Olá! Pode me contar seus gastos/recebimentos em linguagem natural.\n"
+            "Exemplos:\n"
+            "• gastei 45,90 no mercado via cartão hoje\n"
+            "• comprei remédio 34 na farmácia via pix\n"
+            "• ganhei 800 de salário\n"
+            "Se preferir: /add 07/10/2025;Compra;Mercado;Almoço;45,90;Cartão"
+        )
+        await tg_send(chat_id, reply)
         return {"ok": True}
 
-    except HTTPException as e:
-        log("HTTPException", e.status_code, e.detail)
-        await tg_send(chat_id, f"❌ Erro: {e.detail}")
-        return JSONResponse(status_code=200, content={"ok": True})
+    # ===== exige licença para qualquer uso (se habilitado) =====
+    if LICENSE_ENFORCE:
+        ok, msg = require_active_license(chat_id)
+        if not ok:
+            await tg_send(chat_id, f"❗ {msg}")
+            return {"ok": True}
+
+    # ===== /add DD/MM/AAAA;Tipo;Categoria;Descricao;Valor;FormaPagamento =====
+    if text.lower().startswith("/add"):
+        m = re.match(r"^/add\s+(.+)$", text, flags=re.I)
+        if not m:
+            await tg_send(chat_id, "Formato: /add DD/MM/AAAA;Tipo;Categoria;Descricao;Valor;FormaPagamento")
+            return {"ok": True}
+        parts = [p.strip() for p in m.group(1).split(";")]
+        if len(parts) != 6:
+            await tg_send(chat_id, "Faltam campos. Use 6 campos separados por ;")
+            return {"ok": True}
+
+        data_br, tipo, categoria, descricao, valor_str, forma = parts
+        try:
+            dt = datetime.strptime(data_br, "%d/%m/%Y").date()
+            data_iso = dt.strftime("%Y-%m-%d")
+        except:
+            await tg_send(chat_id, "Data inválida. Use DD/MM/AAAA.")
+            return {"ok": True}
+
+        valor = None
+        try:
+            valor = float(valor_str.replace(".", "").replace(",", "."))
+        except:
+            await tg_send(chat_id, "Valor inválido. Ex.: 123,45")
+            return {"ok": True}
+
+        # inferir grupo
+        grupo = map_group(categoria)
+        cond = "à vista"
+        row = [data_iso, tipo, grupo, categoria, descricao, valor, forma, cond]
+
+        try:
+            excel_add_row(row)
+            await tg_send(chat_id, "✅ Lançado!")
+        except Exception as e:
+            await tg_send(chat_id, f"❌ Erro: {e}")
+        return {"ok": True}
+
+    # ===== NLP livre =====
+    row, err = parse_natural(text)
+    if err:
+        await tg_send(chat_id, f"❗ {err}")
+        return {"ok": True}
+
+    try:
+        excel_add_row(row)
+        await tg_send(chat_id, "✅ Lançado!")
     except Exception as e:
-        log("Exception", repr(e))
-        await tg_send(chat_id, f"❌ Erro inesperado: {e}")
-        return JSONResponse(status_code=200, content={"ok": True})
+        await tg_send(chat_id, f"❌ Erro: {e}")
 
-
-# Opcional: endpoint de teste de cópia manual (POST manda JSON {"name": "arquivo.xlsx"})
-@app.post("/test-copy")
-async def test_copy(payload: Dict[str, Any]):
-    name = payload.get("name") or f"Planilha_Teste_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-    info = await copy_template_for_user(name)
-    return info
+    return {"ok": True}
