@@ -1,9 +1,5 @@
-# app.py — Bot de Lançamentos com:
-# - licenciamento (chat_id + e-mail)
-# - cópia no SharePoint/OneDrive
-# - envio de e-mail com link
-# - ONBOARDING guiado (/start -> pede licença -> pede e-mail)
-# - mantém compatibilidade com /start GF-XXX email@...
+# app.py — Bot Telegram + OneDrive/SharePoint + Licenças + E-mail + Onboarding guiado
+# por Gian: cria cópia do template por cliente, nomeia com e-mail, gera link anônimo e envia por e-mail.
 
 import os
 import re
@@ -81,7 +77,6 @@ def licenses_db_init():
             email TEXT,
             FOREIGN KEY (license_key) REFERENCES licenses(license_key)
         )""")
-        # Sessões de onboarding (estado da conversa)
         con.execute("""
         CREATE TABLE IF NOT EXISTS sessions (
             chat_id TEXT PRIMARY KEY,
@@ -90,7 +85,6 @@ def licenses_db_init():
             created_at TEXT,
             updated_at TEXT
         )""")
-        # Migrações leves
         try: con.execute("ALTER TABLE clients ADD COLUMN email TEXT")
         except Exception: pass
         con.execute("""
@@ -347,13 +341,27 @@ def excel_add_row(values: List, chat_id: str):
 EMAIL_SEND_ENABLED = os.getenv("EMAIL_SEND_ENABLED", "0") == "1"
 MAIL_SENDER_UPN = os.getenv("MAIL_SENDER_UPN")
 MAIL_SENDER_USER_ID = os.getenv("MAIL_SENDER_USER_ID")
-SHARE_LINK_TYPE = os.getenv("SHARE_LINK_TYPE", "view")
-SHARE_LINK_SCOPE = os.getenv("SHARE_LINK_SCOPE", "anonymous")
+SHARE_LINK_TYPE = os.getenv("SHARE_LINK_TYPE", "edit")            # "view" ou "edit"
+SHARE_LINK_SCOPE = os.getenv("SHARE_LINK_SCOPE", "anonymous")     # "anonymous" ou "organization"
+SHARE_LINK_PASSWORD = os.getenv("SHARE_LINK_PASSWORD")            # opcional (pode ser vazio)
 
-def graph_create_share_link(drive_id: str, item_id: str, link_type: str = None, scope: str = None) -> str:
+def graph_create_share_link(drive_id: str, item_id: str, link_type: str = None, scope: str = None, password: str | None = None) -> str:
+    """
+    Cria link de compartilhamento para um item (planilha do cliente).
+    Retorna a URL do link (string). Força envio de 'type' e 'scope'.
+    """
     token = msal_token()
     url = f"{GRAPH_BASE}/drives/{drive_id}/items/{item_id}/createLink"
-    payload = {"type": (link_type or SHARE_LINK_TYPE), "scope": (scope or SHARE_LINK_SCOPE)}
+
+    payload = {
+        "type": (link_type or SHARE_LINK_TYPE),
+        "scope": (scope or SHARE_LINK_SCOPE),
+    }
+    # senha opcional (só funciona para links anonymous)
+    pwd = password if password is not None else SHARE_LINK_PASSWORD
+    if (payload["scope"] == "anonymous") and pwd:
+        payload["password"] = pwd
+
     r = requests.post(url, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
                       json=payload, timeout=20)
     if r.status_code >= 300:
@@ -388,11 +396,9 @@ async def setup_client_file(chat_id: str) -> Tuple[bool, Optional[str]]:
     if cli and cli["item_id"]:
         return True, None
 
-    # garantir que temos o e-mail salvo
     to_email = (cli or {}).get("email") if cli else None
     if not to_email:
-        # fallback: usa chat_id para não quebrar (mas o onboarding sempre preenche e-mail antes)
-        to_email = str(chat_id)
+        to_email = str(chat_id)  # fallback (onboarding sempre deve preencher e-mail antes)
     safe_email = re.sub(r'[^A-Za-z0-9@._-]', '_', to_email)
     base_name = f"Lancamentos - {safe_email}.xlsx"
     token = msal_token()
@@ -582,15 +588,14 @@ async def telegram_webhook(req: Request):
             return {"ok": True}
 
     # ===== Onboarding guiado =====
-    # 0) Compatibilidade com /start <lic> <email>
+    # Compatibilidade com /start <lic> <email>
     if low.startswith("/start"):
         record_usage(chat_id, "start")
         parts = text.split()
         token = parts[1].strip() if len(parts) > 1 else None
         email = parts[2].strip() if len(parts) > 2 else None
 
-        # Se veio completo, segue fluxo clássico
-        if token:
+        if token:  # fluxo "antigo" direto
             lic = get_license(token)
             ok, err = is_license_valid(lic)
             if not ok:
@@ -616,7 +621,7 @@ async def telegram_webhook(req: Request):
                 await tg_send(chat_id, f"❌ Erro na configuração da planilha. Fale com o suporte: {file_err}")
                 return {"ok": True}
             await tg_send(chat_id, "🚀 Planilha configurada com sucesso!")
-            # e-mail com link (se habilitado)
+            # enviar e-mail com link
             try:
                 if EMAIL_SEND_ENABLED:
                     cli = get_client(chat_id_str)
@@ -624,9 +629,10 @@ async def telegram_webhook(req: Request):
                     drive_id = cli.get("drive_id") if cli else None
                     item_id  = cli.get("item_id") if cli else None
                     if to_email and drive_id and item_id:
-                        share_url = graph_create_share_link(drive_id, item_id, SHARE_LINK_TYPE, SHARE_LINK_SCOPE)
+                        share_url = graph_create_share_link(drive_id, item_id, SHARE_LINK_TYPE, SHARE_LINK_SCOPE, SHARE_LINK_PASSWORD)
                         subj = "Sua planilha de lançamentos está pronta"
-                        html = f"""<p>Olá!</p><p>Sua planilha foi criada com sucesso. Acesse: <a href="{share_url}">{share_url}</a></p>"""
+                        extra_pwd = f"<p>Senha do link: <b>{SHARE_LINK_PASSWORD}</b></p>" if (SHARE_LINK_PASSWORD and SHARE_LINK_SCOPE=="anonymous") else ""
+                        html = f"""<p>Olá!</p><p>Sua planilha foi criada com sucesso. Acesse: <a href="{share_url}">{share_url}</a></p>{extra_pwd}"""
                         graph_send_mail(to_email, subj, html)
                         await tg_send(chat_id, f"✉️ E-mail enviado para {to_email}")
             except Exception as e:
@@ -638,15 +644,14 @@ async def telegram_webhook(req: Request):
             clear_session(chat_id_str)
             return {"ok": True}
 
-        # Se veio só /start → inicia onboarding
+        # /start sozinho → inicia onboarding
         set_session(chat_id_str, "awaiting_license")
         await tg_send(chat_id, "Olá! 👋\nPor favor, **informe sua licença** (ex.: `GF-ABCD-1234`).\n\nVocê pode digitar /cancel para cancelar.")
         return {"ok": True}
 
-    # 1) Estamos esperando LICENÇA?
+    # aguardando LICENÇA?
     sess = get_session(chat_id_str)
     if sess and sess.get("stage") == "awaiting_license":
-        # considera qualquer texto não-comando como tentativa de licença
         if text.startswith("/"):
             await tg_send(chat_id, "Por favor, envie apenas a *licença* (ex.: `GF-ABCD-1234`) ou /cancel.")
             return {"ok": True}
@@ -664,7 +669,7 @@ async def telegram_webhook(req: Request):
         await tg_send(chat_id, "Licença ok ✅\nAgora me diga seu **e-mail** (ex.: `cliente@gmail.com`).")
         return {"ok": True}
 
-    # 2) Estamos esperando E-MAIL?
+    # aguardando E-MAIL?
     if sess and sess.get("stage") == "awaiting_email":
         if text.startswith("/"):
             await tg_send(chat_id, "Por favor, envie apenas o *e-mail* (ex.: `cliente@gmail.com`) ou /cancel.")
@@ -685,7 +690,7 @@ async def telegram_webhook(req: Request):
             return {"ok": True}
         await tg_send(chat_id, "🚀 Planilha configurada com sucesso!")
 
-        # enviar e-mail com link (se habilitado)
+        # enviar e-mail com link
         try:
             if EMAIL_SEND_ENABLED:
                 cli = get_client(chat_id_str)
@@ -693,9 +698,10 @@ async def telegram_webhook(req: Request):
                 drive_id = cli.get("drive_id") if cli else None
                 item_id  = cli.get("item_id") if cli else None
                 if to_email and drive_id and item_id:
-                    share_url = graph_create_share_link(drive_id, item_id, SHARE_LINK_TYPE, SHARE_LINK_SCOPE)
+                    share_url = graph_create_share_link(drive_id, item_id, SHARE_LINK_TYPE, SHARE_LINK_SCOPE, SHARE_LINK_PASSWORD)
                     subj = "Sua planilha de lançamentos está pronta"
-                    html = f"""<p>Olá!</p><p>Sua planilha foi criada com sucesso. Acesse: <a href="{share_url}">{share_url}</a></p>"""
+                    extra_pwd = f"<p>Senha do link: <b>{SHARE_LINK_PASSWORD}</b></p>" if (SHARE_LINK_PASSWORD and SHARE_LINK_SCOPE=="anonymous") else ""
+                    html = f"""<p>Olá!</p><p>Sua planilha foi criada com sucesso. Acesse: <a href="{share_url}">{share_url}</a></p>{extra_pwd}"""
                     graph_send_mail(to_email, subj, html)
                     await tg_send(chat_id, f"✉️ E-mail enviado para {to_email}")
         except Exception as e:
@@ -705,7 +711,7 @@ async def telegram_webhook(req: Request):
         clear_session(chat_id_str)
         return {"ok": True}
 
-    # ===== exige licença e e-mail antes de lançar (uso normal) =====
+    # ===== uso normal: exige licença e e-mail antes de lançar =====
     if LICENSE_ENFORCE:
         ok, msg = require_active_license(chat_id_str)
         if not ok:
