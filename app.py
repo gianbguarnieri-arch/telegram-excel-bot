@@ -1,5 +1,9 @@
-# app.py — Bot de Lançamentos com Licenciamento (chat_id + e-mail),
-# cópia no SharePoint/OneDrive, e envio por e-mail do link da planilha.
+# app.py — Bot de Lançamentos com:
+# - licenciamento (chat_id + e-mail)
+# - cópia no SharePoint/OneDrive
+# - envio de e-mail com link
+# - ONBOARDING guiado (/start -> pede licença -> pede e-mail)
+# - mantém compatibilidade com /start GF-XXX email@...
 
 import os
 import re
@@ -8,7 +12,6 @@ import sqlite3
 import secrets
 import string
 import asyncio
-import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple, List
 
@@ -26,7 +29,7 @@ app = FastAPI()
 # ENVs (Telegram + Graph app-only)
 # =========================================================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")  # opcional (recomendado)
+TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")  # opcional
 
 TENANT_ID = os.getenv("TENANT_ID")
 CLIENT_ID = os.getenv("CLIENT_ID")
@@ -78,11 +81,18 @@ def licenses_db_init():
             email TEXT,
             FOREIGN KEY (license_key) REFERENCES licenses(license_key)
         )""")
-        # Migração leve: garantir coluna email
-        try:
-            con.execute("ALTER TABLE clients ADD COLUMN email TEXT")
-        except Exception:
-            pass
+        # Sessões de onboarding (estado da conversa)
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            chat_id TEXT PRIMARY KEY,
+            stage TEXT,           -- awaiting_license | awaiting_email | None
+            tmp_license TEXT,
+            created_at TEXT,
+            updated_at TEXT
+        )""")
+        # Migrações leves
+        try: con.execute("ALTER TABLE clients ADD COLUMN email TEXT")
+        except Exception: pass
         con.execute("""
         CREATE TABLE IF NOT EXISTS usage (
             chat_id TEXT,
@@ -202,7 +212,7 @@ def set_client_email(chat_id: str, email: str):
 def require_active_license(chat_id: str):
     cli = get_client(chat_id)
     if not cli:
-        return False, "Para usar o bot você precisa **ativar sua licença**. Envie /start SEU-CÓDIGO (ex.: /start GF-ABCD-1234)."
+        return False, "Para usar o bot você precisa **ativar sua licença**. Envie /start."
     lic = get_license(cli["license_key"]) if cli["license_key"] else None
     ok, err = is_license_valid(lic)
     if not ok:
@@ -214,6 +224,36 @@ def require_email(chat_id: str):
     if not cli or not cli.get("email"):
         return False, "Precisamos do seu e-mail. Envie: /email seu@dominio.com"
     return True, None
+
+# ===== sessions (estado do onboarding) =====
+def get_session(chat_id: str):
+    con = _db()
+    try:
+        cur = con.execute("SELECT stage, tmp_license FROM sessions WHERE chat_id=?", (str(chat_id),))
+        row = cur.fetchone()
+    finally:
+        con.close()
+    if not row: return None
+    return {"stage": row[0], "tmp_license": row[1]}
+
+def set_session(chat_id: str, stage: Optional[str], tmp_license: Optional[str] = None):
+    con = _db()
+    try:
+        con.execute("INSERT OR IGNORE INTO sessions(chat_id, stage, tmp_license, created_at, updated_at) VALUES(?,?,?,?,?)",
+                    (str(chat_id), stage, tmp_license, _now_iso(), _now_iso()))
+        con.execute("UPDATE sessions SET stage=?, tmp_license=?, updated_at=? WHERE chat_id=?",
+                    (stage, tmp_license, _now_iso(), str(chat_id)))
+        con.commit()
+    finally:
+        con.close()
+
+def clear_session(chat_id: str):
+    con = _db()
+    try:
+        con.execute("DELETE FROM sessions WHERE chat_id=?", (str(chat_id),))
+        con.commit()
+    finally:
+        con.close()
 
 # =========================================================
 # Telegram helper
@@ -243,25 +283,20 @@ def msal_token():
         raise RuntimeError(f"MSAL error: {result}")
     return result["access_token"]
 
-# --- Cópia robusta com polling pelo Location e fallback seguro
+# --- copy helpers / Excel helpers ---
 async def _graph_copy_file(template_item_id: str, drive_id: str, dest_folder_id: str, new_file_name: str) -> Optional[str]:
-    """Copia o arquivo modelo e retorna o ID do novo arquivo (item_id)."""
-    if not all([template_item_id, drive_id, dest_folder_id]):
-        raise ValueError("Variáveis de ambiente de template e destino devem estar configuradas.")
-
     token = msal_token()
     source_url = f"{GRAPH_BASE}/drives/{drive_id}/items/{template_item_id}/copy"
     payload = {"parentReference": {"driveId": drive_id, "id": dest_folder_id}, "name": new_file_name}
-
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(source_url, headers={"Authorization": f"Bearer {token}"}, json=payload)
-
+    if r.status_code == 409:
+        raise RuntimeError(f"Erro ao iniciar cópia do template (409 nameAlreadyExists) para '{new_file_name}'")
     if r.status_code != 202:
         raise RuntimeError(f"Erro ao iniciar cópia do template. Código: {r.status_code}, Detalhe: {r.text}")
 
     location = r.headers.get("Location")
     if location:
-        # Poll até ~12s
         async with httpx.AsyncClient(timeout=12) as client:
             for _ in range(10):
                 await asyncio.sleep(1.2)
@@ -270,7 +305,7 @@ async def _graph_copy_file(template_item_id: str, drive_id: str, dest_folder_id:
                     data = pr.json()
                     return data.get("id") or data.get("resourceId") or data.get("itemId")
 
-    # Fallback por children (escapando aspas simples)
+    # fallback: listar filhos e achar pelo nome
     await asyncio.sleep(3)
     safe_name = new_file_name.replace("'", "''")
     search_url = f"{GRAPH_BASE}/drives/{drive_id}/items/{dest_folder_id}/children?$filter=name eq '{safe_name}'"
@@ -283,24 +318,6 @@ async def _graph_copy_file(template_item_id: str, drive_id: str, dest_folder_id:
         return data['value'][0].get('id')
     raise RuntimeError("Não foi possível encontrar o ID da planilha recém-criada após a cópia.")
 
-async def setup_client_file(chat_id: str) -> Tuple[bool, Optional[str]]:
-    """Cria o arquivo de lançamento para o cliente e vincula ao chat_id."""
-    cli = get_client(chat_id)
-    if cli and cli["item_id"]:
-        return True, None
-
-    new_file_name = f"Lancamentos - {chat_id}.xlsx"
-    try:
-        new_item_id = await _graph_copy_file(TEMPLATE_ITEM_ID, DRIVE_ID, DEST_FOLDER_ITEM_ID, new_file_name)
-    except Exception as e:
-        return False, f"Falha ao criar planilha: {e}"
-
-    if not new_item_id:
-        return False, "Não foi possível obter o ID da nova planilha."
-
-    set_client_file(str(chat_id), "drive", DRIVE_ID, new_item_id)
-    return True, None
-
 def _build_workbook_rows_add_url(excel_path: str) -> str:
     if "/drive/items/" in excel_path:
         return f"{GRAPH_BASE}{excel_path}/workbook/worksheets('{WORKSHEET_NAME}')/tables('{TABLE_NAME}')/rows/add"
@@ -308,7 +325,6 @@ def _build_workbook_rows_add_url(excel_path: str) -> str:
         return f"{GRAPH_BASE}{excel_path}:/workbook/worksheets('{WORKSHEET_NAME}')/tables('{TABLE_NAME}')/rows/add"
 
 def excel_path_for_chat(chat_id: str) -> str:
-    """Busca o caminho da planilha do cliente ou retorna o caminho global."""
     cli = get_client(chat_id)
     if cli and cli.get("item_id") and cli.get("drive_id"):
         return f"/drives/{cli['drive_id']}/items/{cli['item_id']}"
@@ -317,7 +333,6 @@ def excel_path_for_chat(chat_id: str) -> str:
     raise RuntimeError(f"Caminho do Excel não configurado para o chat_id {chat_id}.")
 
 def excel_add_row(values: List, chat_id: str):
-    """Insere uma linha na planilha do cliente especificado."""
     if len(values) != 8:
         raise RuntimeError(f"Esperava 8 colunas, recebi {len(values)}.")
     excel_path = excel_path_for_chat(chat_id)
@@ -328,24 +343,17 @@ def excel_add_row(values: List, chat_id: str):
         raise RuntimeError(f"Graph error {r.status_code}: {r.text}")
     return r.json()
 
-# ====== EMAIL / SHARE-LINK HELPERS (GRAPH) ======
+# ====== EMAIL / SHARE-LINK ======
 EMAIL_SEND_ENABLED = os.getenv("EMAIL_SEND_ENABLED", "0") == "1"
-MAIL_SENDER_UPN = os.getenv("MAIL_SENDER_UPN")            # ex.: suporte@seudominio.com
-MAIL_SENDER_USER_ID = os.getenv("MAIL_SENDER_USER_ID")    # GUID opcional
-SHARE_LINK_TYPE = os.getenv("SHARE_LINK_TYPE", "view")    # "view" ou "edit"
-SHARE_LINK_SCOPE = os.getenv("SHARE_LINK_SCOPE", "anonymous")  # "anonymous" ou "organization"
+MAIL_SENDER_UPN = os.getenv("MAIL_SENDER_UPN")
+MAIL_SENDER_USER_ID = os.getenv("MAIL_SENDER_USER_ID")
+SHARE_LINK_TYPE = os.getenv("SHARE_LINK_TYPE", "view")
+SHARE_LINK_SCOPE = os.getenv("SHARE_LINK_SCOPE", "anonymous")
 
 def graph_create_share_link(drive_id: str, item_id: str, link_type: str = None, scope: str = None) -> str:
-    """
-    Cria link de compartilhamento para um item (planilha do cliente).
-    Retorna a URL do link (string).
-    """
     token = msal_token()
     url = f"{GRAPH_BASE}/drives/{drive_id}/items/{item_id}/createLink"
-    payload = {
-        "type": (link_type or SHARE_LINK_TYPE),
-        "scope": (scope or SHARE_LINK_SCOPE),
-    }
+    payload = {"type": (link_type or SHARE_LINK_TYPE), "scope": (scope or SHARE_LINK_SCOPE)}
     r = requests.post(url, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
                       json=payload, timeout=20)
     if r.status_code >= 300:
@@ -354,17 +362,11 @@ def graph_create_share_link(drive_id: str, item_id: str, link_type: str = None, 
     return (data.get("link") or {}).get("webUrl") or (data.get("link") or {}).get("url")
 
 def graph_send_mail(to_email: str, subject: str, html_body: str):
-    """
-    Envia e-mail usando permissões de aplicativo (application) no Graph.
-    Requer Mail.Send (application) + permissão para enviar como o usuário/mailbox configurado.
-    """
     if not (MAIL_SENDER_UPN or MAIL_SENDER_USER_ID):
         raise RuntimeError("Configure MAIL_SENDER_UPN ou MAIL_SENDER_USER_ID para enviar e-mail.")
-
     token = msal_token()
     sender_path = MAIL_SENDER_USER_ID or MAIL_SENDER_UPN
     send_url = f"{GRAPH_BASE}/users/{sender_path}/sendMail"
-
     msg = {
         "message": {
             "subject": subject,
@@ -379,8 +381,59 @@ def graph_send_mail(to_email: str, subject: str, html_body: str):
     if r.status_code not in (202, 200):
         raise RuntimeError(f"sendMail error {r.status_code}: {r.text}")
 
+# ===== criação/reatribuição da planilha, nomeando com o e-mail =====
+async def setup_client_file(chat_id: str) -> Tuple[bool, Optional[str]]:
+    """Cria ou reaproveita a planilha do cliente, nomeando-a com o e-mail."""
+    cli = get_client(chat_id)
+    if cli and cli["item_id"]:
+        return True, None
+
+    # garantir que temos o e-mail salvo
+    to_email = (cli or {}).get("email") if cli else None
+    if not to_email:
+        # fallback: usa chat_id para não quebrar (mas o onboarding sempre preenche e-mail antes)
+        to_email = str(chat_id)
+    safe_email = re.sub(r'[^A-Za-z0-9@._-]', '_', to_email)
+    base_name = f"Lancamentos - {safe_email}.xlsx"
+    token = msal_token()
+
+    # 1) tentar reaproveitar arquivo já existente com esse nome
+    try:
+        safe_name = base_name.replace("'", "''")
+        search_url = f"{GRAPH_BASE}/drives/{DRIVE_ID}/items/{DEST_FOLDER_ITEM_ID}/children?$filter=name eq '{safe_name}'"
+        r = requests.get(search_url, headers={"Authorization": f"Bearer {token}"}, timeout=15)
+        if r.status_code < 300:
+            data = r.json()
+            if data.get("value"):
+                item_id = data["value"][0]["id"]
+                set_client_file(str(chat_id), "drive", DRIVE_ID, item_id)
+                return True, None
+    except Exception:
+        pass
+
+    # 2) criar cópia
+    try:
+        new_item_id = await _graph_copy_file(TEMPLATE_ITEM_ID, DRIVE_ID, DEST_FOLDER_ITEM_ID, base_name)
+        if not new_item_id:
+            return False, "Não foi possível obter o ID da nova planilha."
+        set_client_file(str(chat_id), "drive", DRIVE_ID, new_item_id)
+        return True, None
+    except Exception as e:
+        if "nameAlreadyExists" in str(e):
+            try:
+                suffix = datetime.now().strftime("%Y%m%d-%H%M%S")
+                alt_name = f"Lancamentos - {safe_email} - {suffix}.xlsx"
+                new_item_id = await _graph_copy_file(TEMPLATE_ITEM_ID, DRIVE_ID, DEST_FOLDER_ITEM_ID, alt_name)
+                if not new_item_id:
+                    return False, "Não foi possível obter o ID da planilha (fallback)."
+                set_client_file(str(chat_id), "drive", DRIVE_ID, new_item_id)
+                return True, None
+            except Exception as e2:
+                return False, f"Falha ao criar planilha (fallback): {e2}"
+        return False, f"Falha ao criar planilha: {e}"
+
 # =========================================================
-# NLP e Parsers
+# NLP / Parsers
 # =========================================================
 def parse_money(text: str) -> Optional[float]:
     m = re.search(r"(\d{1,3}(?:\.\d{3})*(?:,\d{2})|\d+(?:\.\d{2})?)", text)
@@ -415,7 +468,7 @@ def detect_payment(text: str) -> str:
     if "pix" in t: return "Pix"
     if "dinheiro" in t or "cash" in t: return "Dinheiro"
     if "débito" in t or "debito" in t: return "Débito"
-    if "crédito" in t or "credito" in t: return "💳 cartão"
+    if "crédito" in t ou "credito" in t: return "💳 cartão"
     return "Outros"
 
 def detect_installments(text: str) -> str:
@@ -470,14 +523,12 @@ def parse_natural(text: str) -> Tuple[Optional[List], Optional[str]]:
     valor = parse_money(text)
     if valor is None:
         return None, "Não achei o valor. Ex.: 45,90"
-
     data_iso = parse_date(text) or datetime.now().strftime("%Y-%m-%d")
     forma = detect_payment(text)
     cond = detect_installments(text)
     cat, desc = detect_category_and_desc(text)
     tipo = "Entrada" if re.search(r"\b(ganhei|recebi|sal[aá]rio|renda)\b", text.lower()) else "Saída"
     grupo = map_group(cat)
-
     return [data_iso, tipo, grupo, cat, (desc or ""), float(valor), forma, cond], None
 
 # =========================================================
@@ -489,7 +540,6 @@ def root():
 
 @app.post("/telegram/webhook")
 async def telegram_webhook(req: Request):
-    # Proteção opcional do webhook por secret token
     if TELEGRAM_WEBHOOK_SECRET:
         header = req.headers.get("x-telegram-bot-api-secret-token")
         if header != TELEGRAM_WEBHOOK_SECRET:
@@ -504,10 +554,16 @@ async def telegram_webhook(req: Request):
         return {"ok": True}
 
     chat_id_str = str(chat_id)
+    low = text.lower()
+
+    # ===== comandos utilitários =====
+    if low == "/cancel":
+        clear_session(chat_id_str)
+        await tg_send(chat_id, "Onboarding cancelado. Envie /start quando quiser recomeçar.")
+        return {"ok": True}
 
     # ===== [ADMIN] comandos de licença =====
     if ADMIN_TELEGRAM_ID and chat_id_str == ADMIN_TELEGRAM_ID:
-        low = text.lower()
         if low.startswith("/licenca nova"):
             try:
                 parts = text.split()
@@ -518,109 +574,138 @@ async def telegram_webhook(req: Request):
             msg = f"🔑 *Licença criada:*\n`{key}`\n*Validade:* {'vitalícia' if not exp else exp}"
             await tg_send(chat_id, msg)
             return {"ok": True}
-
         if low.startswith("/licenca info"):
             await tg_send(chat_id, f"Seu ADMIN ID ({chat_id_str}) está correto. Bot ativo.")
             return {"ok": True}
-
         if low.startswith("/licenca"):
             await tg_send(chat_id, "Comando de licença não reconhecido ou incompleto.")
             return {"ok": True}
 
-    # ===== /email (salvar/atualizar e-mail) =====
-    if text.lower().startswith("/email"):
-        parts = text.split()
-        if len(parts) < 2:
-            await tg_send(chat_id, "Uso: `/email seu@dominio.com`")
-            return {"ok": True}
-        if LICENSE_ENFORCE:
-            ok, msg = require_active_license(chat_id_str)
-            if not ok:
-                await tg_send(chat_id, f"❗ {msg}")
-                return {"ok": True}
-        ok2, err2 = set_client_email(chat_id_str, parts[1].strip())
-        if not ok2:
-            await tg_send(chat_id, f"❌ {err2}")
-        else:
-            await tg_send(chat_id, "✅ E-mail salvo.")
-        return {"ok": True}
-
-    # ===== /start (com token de licença e e-mail opcional) =====
-    if text.lower().startswith("/start"):
+    # ===== Onboarding guiado =====
+    # 0) Compatibilidade com /start <lic> <email>
+    if low.startswith("/start"):
         record_usage(chat_id, "start")
         parts = text.split()
         token = parts[1].strip() if len(parts) > 1 else None
         email = parts[2].strip() if len(parts) > 2 else None
 
-        if LICENSE_ENFORCE and not token:
-            await tg_send(chat_id, "Bem-vindo! Para ativar, envie:\n`/start SEU-CÓDIGO seu@email.com`")
-            return {"ok": True}
-
+        # Se veio completo, segue fluxo clássico
         if token:
             lic = get_license(token)
             ok, err = is_license_valid(lic)
             if not ok:
                 await tg_send(chat_id, f"❌ Licença inválida: {err}")
                 return {"ok": True}
-
             ok2, err2 = bind_license_to_chat(chat_id_str, token)
             if not ok2:
                 await tg_send(chat_id, f"❌ {err2}")
                 return {"ok": True}
-
             if email:
                 ok3, err3 = set_client_email(chat_id_str, email)
                 if not ok3:
                     await tg_send(chat_id, f"❌ {err3}")
                     return {"ok": True}
             else:
-                await tg_send(chat_id, "Ativado! Agora envie seu e-mail: `/email seu@dominio.com`")
+                await tg_send(chat_id, "Licença ok ✅\nAgora me diga seu e-mail (ex.: `cliente@gmail.com`).")
+                set_session(chat_id_str, "awaiting_email")
+                return {"ok": True}
 
             await tg_send(chat_id, "✅ Licença ativada. Configurando sua planilha de lançamentos...")
-
             file_ok, file_err = await setup_client_file(chat_id_str)
             if not file_ok:
                 await tg_send(chat_id, f"❌ Erro na configuração da planilha. Fale com o suporte: {file_err}")
                 return {"ok": True}
-
             await tg_send(chat_id, "🚀 Planilha configurada com sucesso!")
-
-            # ===== Envio de e-mail automático com link da planilha =====
+            # e-mail com link (se habilitado)
             try:
                 if EMAIL_SEND_ENABLED:
                     cli = get_client(chat_id_str)
                     to_email = cli.get("email") if cli else None
                     drive_id = cli.get("drive_id") if cli else None
                     item_id  = cli.get("item_id") if cli else None
-
                     if to_email and drive_id and item_id:
                         share_url = graph_create_share_link(drive_id, item_id, SHARE_LINK_TYPE, SHARE_LINK_SCOPE)
                         subj = "Sua planilha de lançamentos está pronta"
-                        html = f"""
-                        <p>Olá!</p>
-                        <p>Sua planilha foi criada com sucesso. Você pode acessar pelo link abaixo:</p>
-                        <p><a href="{share_url}">{share_url}</a></p>
-                        <p>Qualquer dúvida, é só responder este e-mail.</p>
-                        """
+                        html = f"""<p>Olá!</p><p>Sua planilha foi criada com sucesso. Acesse: <a href="{share_url}">{share_url}</a></p>"""
                         graph_send_mail(to_email, subj, html)
                         await tg_send(chat_id, f"✉️ E-mail enviado para {to_email}")
-                    else:
-                        await tg_send(chat_id, "ℹ️ Não consegui enviar e-mail (faltam email/drive/item). Mas a planilha foi criada.")
             except Exception as e:
-                # não bloqueia o fluxo se o e-mail falhar
                 await tg_send(chat_id, f"⚠️ Planilha criada, mas falhou enviar e-mail: {e}")
 
-        reply = (
-            "Pode me contar seus gastos/recebimentos em linguagem natural.\n"
-            "*Exemplos:*\n"
-            "• _gastei 45,90 no mercado via cartão hoje_\n"
-            "• _comprei remédio 34 na farmácia via pix_\n"
-            "• _ganhei 800 de salário_"
-        )
-        await tg_send(chat_id, reply)
+            reply = ("Pode me contar seus gastos/recebimentos.\n"
+                     "Ex.: _gastei 45,90 no mercado via cartão hoje_")
+            await tg_send(chat_id, reply)
+            clear_session(chat_id_str)
+            return {"ok": True}
+
+        # Se veio só /start → inicia onboarding
+        set_session(chat_id_str, "awaiting_license")
+        await tg_send(chat_id, "Olá! 👋\nPor favor, **informe sua licença** (ex.: `GF-ABCD-1234`).\n\nVocê pode digitar /cancel para cancelar.")
         return {"ok": True}
 
-    # ===== exige licença e e-mail antes de lançar (se habilitado) =====
+    # 1) Estamos esperando LICENÇA?
+    sess = get_session(chat_id_str)
+    if sess and sess.get("stage") == "awaiting_license":
+        # considera qualquer texto não-comando como tentativa de licença
+        if text.startswith("/"):
+            await tg_send(chat_id, "Por favor, envie apenas a *licença* (ex.: `GF-ABCD-1234`) ou /cancel.")
+            return {"ok": True}
+        token = text.strip()
+        lic = get_license(token)
+        ok, err = is_license_valid(lic)
+        if not ok:
+            await tg_send(chat_id, f"❌ Licença inválida: {err}\nTente novamente ou digite /cancel.")
+            return {"ok": True}
+        ok2, err2 = bind_license_to_chat(chat_id_str, token)
+        if not ok2:
+            await tg_send(chat_id, f"❌ {err2}\nTente outra licença ou /cancel.")
+            return {"ok": True}
+        set_session(chat_id_str, "awaiting_email")
+        await tg_send(chat_id, "Licença ok ✅\nAgora me diga seu **e-mail** (ex.: `cliente@gmail.com`).")
+        return {"ok": True}
+
+    # 2) Estamos esperando E-MAIL?
+    if sess and sess.get("stage") == "awaiting_email":
+        if text.startswith("/"):
+            await tg_send(chat_id, "Por favor, envie apenas o *e-mail* (ex.: `cliente@gmail.com`) ou /cancel.")
+            return {"ok": True}
+        email = text.strip()
+        if not EMAIL_RE.match(email):
+            await tg_send(chat_id, "❌ E-mail inválido. Tente algo como `cliente@gmail.com`.")
+            return {"ok": True}
+        ok3, err3 = set_client_email(chat_id_str, email)
+        if not ok3:
+            await tg_send(chat_id, f"❌ {err3}")
+            return {"ok": True}
+
+        await tg_send(chat_id, "✅ Obrigado! Configurando sua planilha de lançamentos...")
+        file_ok, file_err = await setup_client_file(chat_id_str)
+        if not file_ok:
+            await tg_send(chat_id, f"❌ Erro na configuração da planilha. Fale com o suporte: {file_err}")
+            return {"ok": True}
+        await tg_send(chat_id, "🚀 Planilha configurada com sucesso!")
+
+        # enviar e-mail com link (se habilitado)
+        try:
+            if EMAIL_SEND_ENABLED:
+                cli = get_client(chat_id_str)
+                to_email = cli.get("email") if cli else None
+                drive_id = cli.get("drive_id") if cli else None
+                item_id  = cli.get("item_id") if cli else None
+                if to_email and drive_id and item_id:
+                    share_url = graph_create_share_link(drive_id, item_id, SHARE_LINK_TYPE, SHARE_LINK_SCOPE)
+                    subj = "Sua planilha de lançamentos está pronta"
+                    html = f"""<p>Olá!</p><p>Sua planilha foi criada com sucesso. Acesse: <a href="{share_url}">{share_url}</a></p>"""
+                    graph_send_mail(to_email, subj, html)
+                    await tg_send(chat_id, f"✉️ E-mail enviado para {to_email}")
+        except Exception as e:
+            await tg_send(chat_id, f"⚠️ Planilha criada, mas falhou enviar e-mail: {e}")
+
+        await tg_send(chat_id, "Tudo certo! Agora pode me contar seus gastos/recebimentos. Ex.: _gastei 45,90 no mercado via cartão hoje_")
+        clear_session(chat_id_str)
+        return {"ok": True}
+
+    # ===== exige licença e e-mail antes de lançar (uso normal) =====
     if LICENSE_ENFORCE:
         ok, msg = require_active_license(chat_id_str)
         if not ok:
@@ -631,14 +716,13 @@ async def telegram_webhook(req: Request):
             await tg_send(chat_id, f"❗ {msg2}")
             return {"ok": True}
 
-    # ===== Processamento de Lançamentos (NLP) =====
+    # ===== Processamento de Lançamentos =====
     row, err = parse_natural(text)
     if err:
         await tg_send(chat_id, f"❗ {err}")
         return {"ok": True}
 
     try:
-        # Lançamento na planilha específica do cliente
         excel_add_row(row, chat_id_str)
         await tg_send(chat_id, "✅ Lançado!")
     except Exception as e:
