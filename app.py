@@ -51,6 +51,15 @@ EMAIL_SEND_ENABLED = os.getenv("EMAIL_SEND_ENABLED", "0") == "1"
 MAIL_SENDER_UPN = os.getenv("MAIL_SENDER_UPN")  # UPN do remetente (conta da org com mailbox)
 
 # =========================
+# ESTADO EFÊMERO DE CONVERSA
+# =========================
+# chat_id -> { step: "ask_license"|"ask_email", "license_key": str }
+pending: Dict[str, Dict] = {}
+
+def reset_pending(chat_id: str):
+    pending.pop(str(chat_id), None)
+
+# =========================
 # BANCO (licenses)
 # =========================
 def licenses_db_init():
@@ -101,7 +110,7 @@ def get_license(code: str):
         return None
     return {"license_key": row[0], "email": row[1], "status": row[2], "expires_at": row[3]}
 
-def is_license_valid(code: str, email: str):
+def is_license_valid_for_email(code: str, email: str):
     lic = get_license(code)
     if not lic:
         return False, "Licença não encontrada."
@@ -296,27 +305,14 @@ def graph_send_mail(to_email: str, subject: str, html_body: str):
         raise RuntimeError(f"sendMail error {r.status_code}: {r.text}")
 
 # =========================
-# EXCEL: inserir linha (se necessário no futuro)
-# =========================
-def _build_workbook_rows_add_url(excel_path: str) -> str:
-    if "/drive/items/" in excel_path:
-        return f"{GRAPH_BASE}{excel_path}/workbook/worksheets('{WORKSHEET_NAME}')/tables('{TABLE_NAME}')/rows/add"
-    else:
-        return f"{GRAPH_BASE}{excel_path}:/workbook/worksheets('{WORKSHEET_NAME}')/tables('{TABLE_NAME}')/rows/add"
-
-def excel_path_for_item(drive_id: str, item_id: str) -> str:
-    return f"/drives/{drive_id}/items/{item_id}"
-
-# =========================
-# FUNÇÃO: criar planilha do cliente + link + e-mail
+# PROVISIONAMENTO: cria/copia + link + e-mail
 # =========================
 async def provision_for_client(email: str) -> Tuple[bool, Optional[str], Optional[str]]:
     """Cria a cópia nomeada com o e-mail, gera link e envia e-mail. Retorna (ok, err, share_url)."""
-    # nome do arquivo
     safe_email = re.sub(r"[^A-Za-z0-9._@+-]", "_", email.strip())
     file_name = f"Lancamentos - {safe_email}.xlsx"
 
-    # 1) tenta encontrar existente por nome (para reuso)
+    # Tenta reusar se já existir com o mesmo nome
     try:
         token = msal_token()
         safe = file_name.replace("'", "''")
@@ -326,25 +322,24 @@ async def provision_for_client(email: str) -> Tuple[bool, Optional[str], Optiona
             data = r.json()
             if data.get("value"):
                 item_id = data["value"][0]["id"]
-                # gera link novo
                 share_url = graph_create_share_link(DRIVE_ID, item_id)
                 return True, None, share_url
     except Exception:
         pass
 
-    # 2) copia template
+    # Copia o template
     try:
         new_item_id = await graph_copy_file(TEMPLATE_ITEM_ID, DRIVE_ID, DEST_FOLDER_ITEM_ID, file_name)
     except Exception as e:
         return False, f"Falha ao criar planilha: {e}", None
 
-    # 3) link de compartilhamento
+    # Cria link
     try:
         share_url = graph_create_share_link(DRIVE_ID, new_item_id)
     except Exception as e:
         return True, f"Planilha criada, mas falhou ao gerar link: {e}", None
 
-    # 4) e-mail ao cliente
+    # Envia e-mail
     try:
         if EMAIL_SEND_ENABLED:
             extra_pwd = f"<p>Senha do link: <b>{SHARE_LINK_PASSWORD}</b></p>" if (SHARE_LINK_PASSWORD and SHARE_LINK_SCOPE == "anonymous") else ""
@@ -355,14 +350,13 @@ async def provision_for_client(email: str) -> Tuple[bool, Optional[str], Optiona
             {extra_pwd}
             """
             graph_send_mail(email, "Sua planilha de lançamentos está pronta", html)
-    except Exception as e:
-        # não bloqueia o fluxo por erro de e-mail
+    except Exception:
         pass
 
     return True, None, share_url
 
 # =========================
-# TELEGRAM WEBHOOK
+# ROTEAMENTO TELEGRAM
 # =========================
 @app.post("/telegram/webhook")
 async def telegram_webhook(
@@ -382,8 +376,10 @@ async def telegram_webhook(
     if not chat_id or not text:
         return {"ok": True}
 
+    chat_id_str = str(chat_id)
+
     # ===== ADMIN =====
-    if ADMIN_TELEGRAM_ID and str(chat_id) == str(ADMIN_TELEGRAM_ID):
+    if ADMIN_TELEGRAM_ID and chat_id_str == str(ADMIN_TELEGRAM_ID):
         if low.startswith("/licenca nova"):
             parts = text.split()
             # /licenca nova CODIGO EMAIL [DIAS]
@@ -408,36 +404,75 @@ async def telegram_webhook(
                 await tg_send(chat_id, f"❌ Erro ao inicializar DB: {e}")
             return {"ok": True}
 
-    # ===== CLIENTE: /start CODIGO EMAIL =====
+    # ===== FLUXO AMIGÁVEL =====
+    # 1) Início
     if low.startswith("/start"):
-        parts = text.split()
-        if len(parts) < 3:
-            await tg_send(chat_id, "Uso: `/start CODIGO EMAIL`\nEx.: `/start GF-ABCD-1234 cliente@gmail.com`")
-            return {"ok": True}
-
-        code = parts[1].strip().upper()
-        email = parts[2].strip()
-
-        ok, err = is_license_valid(code, email)
-        if not ok:
-            await tg_send(chat_id, f"❌ {err}")
-            return {"ok": True}
-
-        await tg_send(chat_id, "✅ Licença válida! Criando sua planilha personalizada…")
-        ok2, err2, share = await provision_for_client(email)
-        if not ok2:
-            await tg_send(chat_id, f"❌ {err2}")
-            return {"ok": True}
-
-        if share:
-            await tg_send(chat_id, f"🚀 Planilha pronta!\n\nLink de acesso:\n{share}\n\nSe preferir, verifique seu e-mail — enviamos o link por lá também.")
-        else:
-            await tg_send(chat_id, "🚀 Planilha pronta! (Não foi possível gerar o link agora.)")
-
+        reset_pending(chat_id_str)
+        pending[chat_id_str] = {"step": "ask_license"}
+        await tg_send(chat_id, "🔑 *Informe sua licença* (ex.: `GF-ABCD-1234`)\n\nDigite */cancel* para cancelar.")
         return {"ok": True}
 
-    # fallback
-    await tg_send(chat_id, "Comando não reconhecido. Use:\n• `/start CODIGO EMAIL`\n• (admin) `/licenca nova CODIGO EMAIL [DIAS]`")
+    # 2) Passos guiados
+    state = pending.get(chat_id_str)
+    if state:
+        # Cancelar
+        if low.startswith("/cancel"):
+            reset_pending(chat_id_str)
+            await tg_send(chat_id, "✅ Cancelado. Envie */start* para começar novamente.")
+            return {"ok": True}
+
+        # Passo: licença
+        if state.get("step") == "ask_license":
+            license_key = text.strip().upper()
+            lic = get_license(license_key)
+            if not lic:
+                await tg_send(chat_id, "❌ Licença não encontrada. Tente novamente ou digite */cancel*.")
+                return {"ok": True}
+            if lic["status"] != "active":
+                await tg_send(chat_id, "❌ Licença inativa. Fale com o suporte.")
+                return {"ok": True}
+            if lic["expires_at"]:
+                try:
+                    if datetime.now(timezone.utc) > datetime.fromisoformat(lic["expires_at"]):
+                        await tg_send(chat_id, "❌ Licença expirada. Fale com o suporte.")
+                        return {"ok": True}
+                except Exception:
+                    await tg_send(chat_id, "❌ Validade da licença inválida. Fale com o suporte.")
+                    return {"ok": True}
+
+            pending[chat_id_str] = {"step": "ask_email", "license_key": license_key}
+            await tg_send(chat_id, "📧 *Informe seu e-mail* (ex.: `cliente@gmail.com`)")
+            return {"ok": True}
+
+        # Passo: e-mail
+        if state.get("step") == "ask_email":
+            email = text.strip()
+            if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
+                await tg_send(chat_id, "❌ E-mail inválido. Tente novamente (ex.: `cliente@gmail.com`) ou digite */cancel*.")
+                return {"ok": True}
+
+            license_key = state.get("license_key")
+            ok, err = is_license_valid_for_email(license_key, email)
+            if not ok:
+                await tg_send(chat_id, f"❌ {err}")
+                return {"ok": True}
+
+            await tg_send(chat_id, "⏳ Configurando sua planilha…")
+            ok2, err2, share = await provision_for_client(email)
+            reset_pending(chat_id_str)
+
+            if not ok2:
+                await tg_send(chat_id, f"❌ {err2}")
+                return {"ok": True}
+
+            if share:
+                await tg_send(chat_id, f"🚀 *Sua planilha foi criada!*\n\nAcesse:\n{share}\n\nSe preferir, verifique seu e-mail — enviamos o link por lá também.")
+            else:
+                await tg_send(chat_id, "🚀 *Sua planilha foi criada!* (Não foi possível gerar o link agora.)")
+            return {"ok": True}
+
+    # ===== fallback =====
+    await tg_send(chat_id, "Use */start* para começar.\n(Admin: `/licenca nova CODIGO EMAIL [DIAS]`)")
     return {"ok": True}
 
 @app.get("/")
