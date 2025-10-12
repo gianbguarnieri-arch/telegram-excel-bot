@@ -1,8 +1,6 @@
 import os
 import re
 import sqlite3
-import secrets
-import string
 import asyncio
 import time
 from datetime import datetime, timedelta, timezone
@@ -23,8 +21,8 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID")
 TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET")
 
-# SQLite
-SQLITE_PATH = os.getenv("SQLITE_PATH", "/tmp/licenses.db")
+# SQLite (Render Free => /tmp)
+SQLITE_PATH = os.getenv("SQLITE_PATH", "/tmp/db.sqlite")
 
 # Graph
 TENANT_ID = os.getenv("TENANT_ID")
@@ -32,12 +30,12 @@ CLIENT_ID = os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
-# Cópia de arquivo
+# Cópia de arquivo (template → pasta de destino)
 DRIVE_ID = os.getenv("DRIVE_ID")
 TEMPLATE_ITEM_ID = os.getenv("TEMPLATE_ITEM_ID")
 DEST_FOLDER_ITEM_ID = os.getenv("DEST_FOLDER_ITEM_ID")
 
-# Excel (tabela dentro do template)
+# Excel (worksheet/table no template)
 WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "Plan1")
 TABLE_NAME = os.getenv("TABLE_NAME", "Lancamentos")
 
@@ -48,7 +46,7 @@ SHARE_LINK_PASSWORD = os.getenv("SHARE_LINK_PASSWORD") or None
 
 # E-mail
 EMAIL_SEND_ENABLED = os.getenv("EMAIL_SEND_ENABLED", "0") == "1"
-MAIL_SENDER_UPN = os.getenv("MAIL_SENDER_UPN")  # UPN do remetente (conta da org com mailbox)
+MAIL_SENDER_UPN = os.getenv("MAIL_SENDER_UPN")  # UPN do remetente com mailbox
 
 # =========================
 # ESTADO EFÊMERO DE CONVERSA
@@ -60,62 +58,79 @@ def reset_pending(chat_id: str):
     pending.pop(str(chat_id), None)
 
 # =========================
-# BANCO (licenses)
+# BANCO
 # =========================
-def licenses_db_init():
-    con = sqlite3.connect(SQLITE_PATH)
+def _db():
+    return sqlite3.connect(SQLITE_PATH)
+
+def db_init():
+    con = _db()
     con.execute("""
     CREATE TABLE IF NOT EXISTS licenses (
         license_key TEXT PRIMARY KEY,
         email TEXT NOT NULL,
         status TEXT NOT NULL DEFAULT 'active',
         expires_at TEXT
-    )
-    """)
-    con.commit()
-    con.close()
+    )""")
+    con.execute("""
+    CREATE TABLE IF NOT EXISTS clients (
+        chat_id TEXT PRIMARY KEY,
+        email TEXT NOT NULL,
+        drive_id TEXT,
+        item_id TEXT,
+        created_at TEXT,
+        last_seen_at TEXT
+    )""")
+    con.commit(); con.close()
 
 @app.on_event("startup")
 def _auto_init_db():
     try:
-        dbdir = os.path.dirname(SQLITE_PATH)
-        if dbdir:
-            os.makedirs(dbdir, exist_ok=True)
+        os.makedirs(os.path.dirname(SQLITE_PATH), exist_ok=True)
     except Exception:
         pass
-    try:
-        licenses_db_init()
-        print(f"✅ DB inicializado em {SQLITE_PATH}")
-    except Exception as e:
-        print(f"❌ Erro ao inicializar DB: {e}")
+    db_init()
+    print(f"✅ DB pronto em {SQLITE_PATH}")
+
+def upsert_client(chat_id: str, email: str, drive_id: Optional[str], item_id: Optional[str]):
+    con = _db()
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    con.execute("INSERT OR IGNORE INTO clients(chat_id, email, created_at, last_seen_at) VALUES(?,?,?,?)",
+                (chat_id, email.lower().strip(), now, now))
+    con.execute("UPDATE clients SET email=?, drive_id=?, item_id=?, last_seen_at=? WHERE chat_id=?",
+                (email.lower().strip(), drive_id, item_id, now, chat_id))
+    con.commit(); con.close()
+
+def get_client(chat_id: str):
+    con = _db()
+    cur = con.execute("SELECT chat_id,email,drive_id,item_id,created_at,last_seen_at FROM clients WHERE chat_id=?",
+                      (chat_id,))
+    row = cur.fetchone(); con.close()
+    if not row: return None
+    return {"chat_id": row[0], "email": row[1], "drive_id": row[2], "item_id": row[3],
+            "created_at": row[4], "last_seen_at": row[5]}
 
 def create_license(code: str, email: str, days: int = 7):
     exp = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat(timespec="seconds")
-    con = sqlite3.connect(SQLITE_PATH)
+    con = _db()
     con.execute("""
         INSERT OR REPLACE INTO licenses(license_key, email, status, expires_at)
         VALUES (?, ?, 'active', ?)
     """, (code.upper().strip(), email.lower().strip(), exp))
-    con.commit()
-    con.close()
+    con.commit(); con.close()
 
 def get_license(code: str):
-    con = sqlite3.connect(SQLITE_PATH)
-    cur = con.cursor()
-    cur.execute("SELECT license_key, email, status, expires_at FROM licenses WHERE license_key=?",
-                (code.upper().strip(),))
-    row = cur.fetchone()
-    con.close()
-    if not row:
-        return None
+    con = _db()
+    cur = con.execute("SELECT license_key,email,status,expires_at FROM licenses WHERE license_key=?",
+                      (code.upper().strip(),))
+    row = cur.fetchone(); con.close()
+    if not row: return None
     return {"license_key": row[0], "email": row[1], "status": row[2], "expires_at": row[3]}
 
 def is_license_valid_for_email(code: str, email: str):
     lic = get_license(code)
-    if not lic:
-        return False, "Licença não encontrada."
-    if lic["status"] != "active":
-        return False, "Licença inativa."
+    if not lic: return False, "Licença não encontrada."
+    if lic["status"] != "active": return False, "Licença inativa."
     if lic["email"].lower().strip() != email.lower().strip():
         return False, "E-mail não corresponde à licença."
     if lic["expires_at"]:
@@ -155,7 +170,7 @@ def msal_token():
     return result["access_token"]
 
 # =========================
-# GRAPH: helpers (itens)
+# GRAPH: itens / cópia
 # =========================
 def graph_get_item(drive_id: str, item_id: str) -> bool:
     token = msal_token()
@@ -172,13 +187,8 @@ def graph_wait_item_available(drive_id: str, item_id: str, timeout_sec: int = 25
     return False
 
 async def graph_copy_file(template_item_id: str, drive_id: str, dest_folder_id: str, new_file_name: str) -> Optional[str]:
-    """
-    Copia o arquivo modelo e retorna o ID do novo arquivo (item_id).
-    Faz polling até ~60s para o item aparecer; resolve 409 com sufixo único.
-    """
     if not all([template_item_id, drive_id, dest_folder_id]):
         raise RuntimeError("DRIVE_ID, TEMPLATE_ITEM_ID, DEST_FOLDER_ITEM_ID precisam estar configurados.")
-
     token = msal_token()
     source_url = f"{GRAPH_BASE}/drives/{drive_id}/items/{template_item_id}/copy"
 
@@ -224,7 +234,7 @@ async def graph_copy_file(template_item_id: str, drive_id: str, dest_folder_id: 
     return res
 
 # =========================
-# GRAPH: permissions / links
+# GRAPH: permissões / link
 # =========================
 def graph_list_permissions(drive_id: str, item_id: str) -> list:
     token = msal_token()
@@ -245,10 +255,8 @@ def graph_create_share_link(drive_id: str, item_id: str,
                             link_type: Optional[str] = None,
                             scope: Optional[str] = None,
                             password: Optional[str] = None) -> str:
-    # aguarda visibilidade
     graph_wait_item_available(drive_id, item_id, timeout_sec=25)
-
-    # remove links antigos (evita reuso)
+    # remove links antigos
     try:
         perms = graph_list_permissions(drive_id, item_id)
         for p in perms:
@@ -259,16 +267,13 @@ def graph_create_share_link(drive_id: str, item_id: str,
 
     token = msal_token()
     url = f"{GRAPH_BASE}/drives/{drive_id}/items/{item_id}/createLink"
-    payload = {
-        "type": (link_type or SHARE_LINK_TYPE),
-        "scope": (scope or SHARE_LINK_SCOPE),
-    }
+    payload = {"type": (link_type or SHARE_LINK_TYPE), "scope": (scope or SHARE_LINK_SCOPE)}
     pwd = password if password is not None else SHARE_LINK_PASSWORD
     if (payload["scope"] == "anonymous") and pwd:
         payload["password"] = pwd
 
     last_err = None
-    for attempt in range(6):  # retry 404 com backoff
+    for attempt in range(6):
         r = requests.post(url, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
                           json=payload, timeout=20)
         if r.status_code < 300:
@@ -282,7 +287,7 @@ def graph_create_share_link(drive_id: str, item_id: str,
     raise RuntimeError(f"createLink error 404 after retries: {last_err}")
 
 # =========================
-# GRAPH: enviar e-mail
+# GRAPH: e-mail
 # =========================
 def graph_send_mail(to_email: str, subject: str, html_body: str):
     if not EMAIL_SEND_ENABLED:
@@ -305,14 +310,13 @@ def graph_send_mail(to_email: str, subject: str, html_body: str):
         raise RuntimeError(f"sendMail error {r.status_code}: {r.text}")
 
 # =========================
-# PROVISIONAMENTO: cria/copia + link + e-mail
+# PROVISIONAMENTO
 # =========================
-async def provision_for_client(email: str) -> Tuple[bool, Optional[str], Optional[str]]:
-    """Cria a cópia nomeada com o e-mail, gera link e envia e-mail. Retorna (ok, err, share_url)."""
+async def provision_for_client(chat_id: str, email: str) -> Tuple[bool, Optional[str], Optional[str]]:
     safe_email = re.sub(r"[^A-Za-z0-9._@+-]", "_", email.strip())
     file_name = f"Lancamentos - {safe_email}.xlsx"
 
-    # Tenta reusar se já existir com o mesmo nome
+    # Reuso se já existir
     try:
         token = msal_token()
         safe = file_name.replace("'", "''")
@@ -322,24 +326,28 @@ async def provision_for_client(email: str) -> Tuple[bool, Optional[str], Optiona
             data = r.json()
             if data.get("value"):
                 item_id = data["value"][0]["id"]
+                upsert_client(chat_id, email, DRIVE_ID, item_id)
                 share_url = graph_create_share_link(DRIVE_ID, item_id)
                 return True, None, share_url
     except Exception:
         pass
 
-    # Copia o template
+    # Copia template
     try:
         new_item_id = await graph_copy_file(TEMPLATE_ITEM_ID, DRIVE_ID, DEST_FOLDER_ITEM_ID, file_name)
     except Exception as e:
         return False, f"Falha ao criar planilha: {e}", None
 
-    # Cria link
+    # Link
     try:
         share_url = graph_create_share_link(DRIVE_ID, new_item_id)
     except Exception as e:
+        upsert_client(chat_id, email, DRIVE_ID, new_item_id)
         return True, f"Planilha criada, mas falhou ao gerar link: {e}", None
 
-    # Envia e-mail
+    upsert_client(chat_id, email, DRIVE_ID, new_item_id)
+
+    # E-mail
     try:
         if EMAIL_SEND_ENABLED:
             extra_pwd = f"<p>Senha do link: <b>{SHARE_LINK_PASSWORD}</b></p>" if (SHARE_LINK_PASSWORD and SHARE_LINK_SCOPE == "anonymous") else ""
@@ -354,6 +362,93 @@ async def provision_for_client(email: str) -> Tuple[bool, Optional[str], Optiona
         pass
 
     return True, None, share_url
+
+# =========================
+# NLP simples + lançamento
+# =========================
+def parse_money(text: str) -> Optional[float]:
+    m = re.search(r"(\d{1,3}(?:\.\d{3})*(?:,\d{2})|\d+(?:\.\d{2})?)", text)
+    if not m: return None
+    val = m.group(1).replace(".", "").replace(",", ".")
+    try:
+        return float(val)
+    except:
+        return None
+
+def parse_date(text: str) -> Optional[str]:
+    t = text.lower()
+    today = datetime.now().date()
+    if "hoje" in t: return today.strftime("%Y-%m-%d")
+    if "ontem" in t: return (today - timedelta(days=1)).strftime("%Y-%m-%d")
+    m = re.search(r"\b(\d{1,2})/(\d{1,2})(?:/(\d{4}))?\b", text)
+    if m:
+        d, mo, y = m.group(1), m.group(2), m.group(3) or str(today.year)
+        try:
+            dt = datetime.strptime(f"{d}/{mo}/{y}", "%d/%m/%Y").date()
+            return dt.strftime("%Y-%m-%d")
+        except: return None
+    return None
+
+def detect_payment(text: str) -> str:
+    t = text.lower()
+    if "pix" in t: return "Pix"
+    if "dinheiro" in t or "cash" in t: return "Dinheiro"
+    if "débito" in t or "debito" in t: return "Débito"
+    if "crédito" in t or "credito" in t: return "💳 cartão"
+    return "Outros"
+
+def detect_installments(text: str) -> str:
+    t = text.lower()
+    m = re.search(r"(\d{1,2})x", t)
+    if m: return f"{m.group(1)}x"
+    if "parcelad" in t: return "parcelado"
+    if "à vista" in t or "a vista" in t or "avista" in t: return "à vista"
+    return "à vista"
+
+CATEGORIES = {
+    "Restaurante": ["restaurante", "almoço", "jantar", "lanche", "pizza", "hamburg", "sushi"],
+    "Mercado": ["mercado", "supermercado", "rancho", "hortifruti"],
+    "Farmácia": ["farmácia", "remédio", "medicamento", "drogaria"],
+    "Combustível": ["gasolina", "álcool", "etanol", "diesel", "posto", "combustível"],
+    "Ifood": ["ifood", "i-food"],
+    "Passeio em família": ["passeio", "parque", "cinema", "lazer"],
+    "Viagem": ["hotel", "passagem", "viagem", "airbnb"],
+    "Assinatura": ["netflix", "amazon", "disney", "spotify", "premiere"],
+    "Aluguel": ["aluguel", "condomínio"], "Água": ["água"], "Energia": ["energia","luz"],
+    "Internet": ["internet","fibra"], "Escola": ["escola","mensalidade"], "Imposto": ["iptu","ipva"]
+}
+
+def map_group(category: str) -> str:
+    if category in ["Aluguel","Água","Energia","Internet","Plano de Saúde","Escola","Assinatura"]: return "Gastos Fixos"
+    if category in ["Imposto","Financiamento","Empréstimo"]: return "Despesas Temporárias"
+    return "Gastos Variáveis"
+
+def detect_category_and_desc(text: str) -> Tuple[str, Optional[str]]:
+    t = text.lower()
+    for cat, kws in CATEGORIES.items():
+        for kw in kws:
+            if kw in t:
+                return cat, None
+    return "Outros", None
+
+def parse_natural(text: str) -> Tuple[Optional[List], Optional[str]]:
+    valor = parse_money(text)
+    if valor is None:
+        return None, "Não achei o valor. Ex.: 45,90"
+    data_iso = parse_date(text) or datetime.now().strftime("%Y-%m-%d")
+    forma = detect_payment(text)
+    cond = detect_installments(text)
+    cat, desc = detect_category_and_desc(text)
+    tipo = "Entrada" if re.search(r"\b(ganhei|recebi|sal[aá]rio|renda)\b", text.lower()) else "Saída"
+    grupo = map_group(cat)
+    return [data_iso, tipo, grupo, cat, (desc or ""), float(valor), forma, cond], None
+
+def excel_add_row_by_item(drive_id: str, item_id: str, values: List):
+    token = msal_token()
+    url = f"{GRAPH_BASE}/drives/{drive_id}/items/{item_id}/workbook/worksheets('{WORKSHEET_NAME}')/tables('{TABLE_NAME}')/rows/add"
+    r = requests.post(url, headers={"Authorization": f"Bearer {token}"}, json={"values": [values]}, timeout=25)
+    if r.status_code >= 300:
+        raise RuntimeError(f"Graph error {r.status_code}: {r.text}")
 
 # =========================
 # ROTEAMENTO TELEGRAM
@@ -398,30 +493,26 @@ async def telegram_webhook(
 
         if low.startswith("/db init"):
             try:
-                licenses_db_init()
+                db_init()
                 await tg_send(chat_id, f"✅ DB inicializado em `{SQLITE_PATH}`")
             except Exception as e:
                 await tg_send(chat_id, f"❌ Erro ao inicializar DB: {e}")
             return {"ok": True}
 
     # ===== FLUXO AMIGÁVEL =====
-    # 1) Início
     if low.startswith("/start"):
         reset_pending(chat_id_str)
         pending[chat_id_str] = {"step": "ask_license"}
         await tg_send(chat_id, "🔑 *Informe sua licença* (ex.: `GF-ABCD-1234`)\n\nDigite */cancel* para cancelar.")
         return {"ok": True}
 
-    # 2) Passos guiados
     state = pending.get(chat_id_str)
     if state:
-        # Cancelar
         if low.startswith("/cancel"):
             reset_pending(chat_id_str)
             await tg_send(chat_id, "✅ Cancelado. Envie */start* para começar novamente.")
             return {"ok": True}
 
-        # Passo: licença
         if state.get("step") == "ask_license":
             license_key = text.strip().upper()
             lic = get_license(license_key)
@@ -444,7 +535,6 @@ async def telegram_webhook(
             await tg_send(chat_id, "📧 *Informe seu e-mail* (ex.: `cliente@gmail.com`)")
             return {"ok": True}
 
-        # Passo: e-mail
         if state.get("step") == "ask_email":
             email = text.strip()
             if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
@@ -458,7 +548,7 @@ async def telegram_webhook(
                 return {"ok": True}
 
             await tg_send(chat_id, "⏳ Configurando sua planilha…")
-            ok2, err2, share = await provision_for_client(email)
+            ok2, err2, share = await provision_for_client(chat_id_str, email)
             reset_pending(chat_id_str)
 
             if not ok2:
@@ -466,13 +556,33 @@ async def telegram_webhook(
                 return {"ok": True}
 
             if share:
-                await tg_send(chat_id, f"🚀 *Sua planilha foi criada!*\n\nAcesse:\n{share}\n\nSe preferir, verifique seu e-mail — enviamos o link por lá também.")
+                await tg_send(chat_id, f"🚀 *Sua planilha foi criada!*\n\nAcesse:\n{share}\n\nAgora é só me mandar mensagens como:\n_\"gastei 45,90 no mercado via pix hoje\"_ que eu lanço pra você 😉")
             else:
-                await tg_send(chat_id, "🚀 *Sua planilha foi criada!* (Não foi possível gerar o link agora.)")
+                await tg_send(chat_id, "🚀 *Sua planilha foi criada!* (não consegui gerar o link agora).")
             return {"ok": True}
 
+    # ===== LANÇAMENTOS (modo uso) =====
+    # Se não é comando e não está no fluxo pendente → tenta lançar
+    if not low.startswith("/"):
+        cli = get_client(chat_id_str)
+        if not cli or not cli.get("item_id") or not cli.get("drive_id"):
+            await tg_send(chat_id, "Para começar, envie */start* e faça a configuração inicial.")
+            return {"ok": True}
+
+        row, perr = parse_natural(text)
+        if perr:
+            await tg_send(chat_id, f"❗ {perr}\nEx.: _gastei 45,90 no mercado via pix hoje_")
+            return {"ok": True}
+
+        try:
+            excel_add_row_by_item(cli["drive_id"], cli["item_id"], row)
+            await tg_send(chat_id, "✅ Lançado!")
+        except Exception as e:
+            await tg_send(chat_id, f"❌ Erro ao lançar na planilha: {e}")
+        return {"ok": True}
+
     # ===== fallback =====
-    await tg_send(chat_id, "Use */start* para começar.\n(Admin: `/licenca nova CODIGO EMAIL [DIAS]`)")
+    await tg_send(chat_id, "Use */start* para configurar ou me envie um lançamento, ex.: _gastei 45,90 no mercado via pix hoje_.")
     return {"ok": True}
 
 @app.get("/")
