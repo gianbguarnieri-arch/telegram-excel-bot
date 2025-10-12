@@ -136,7 +136,8 @@ def drive_service():
 def drive_search_by_name_in_folder(name: str, folder_id: str) -> Optional[str]:
     """Retorna o ID do primeiro arquivo com nome exato dentro da pasta."""
     try:
-        q = f"name = '{name.replace(\"'\", \"\\'\")}' and '{folder_id}' in parents and trashed = false"
+safe_name = name.replace("'", "\\'")
+q = f"name = '{safe_name}' and '{folder_id}' in parents and trashed = false"
         resp = drive_service().files().list(q=q, spaces="drive", fields="files(id, name)", pageSize=1).execute()
         files = resp.get("files", [])
         if files:
