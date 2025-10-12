@@ -2,7 +2,6 @@ fastapi
 uvicorn[standard]
 httpx
 requests
-gspread
-google-auth
-google-auth-oauthlib
+msal
 google-api-python-client
+google-auth
