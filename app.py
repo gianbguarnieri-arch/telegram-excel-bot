@@ -4,17 +4,17 @@ import json
 import sqlite3
 import secrets
 import string
-import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple, List
 
-import requests
 import httpx
 from fastapi import FastAPI, Request, Header
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 
-# Google APIs (Service Account)
+# Google APIs
 from google.oauth2 import service_account
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
@@ -24,27 +24,37 @@ from googleapiclient.errors import HttpError
 app = FastAPI()
 
 # =========================================================
-# ENVs (Telegram + Google SA)
+# ENVs (Telegram + Google)
 # =========================================================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID")
+TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
 
 SQLITE_PATH = os.getenv("SQLITE_PATH", "/tmp/db.sqlite")
 
-# Google Service Account JSON (conteúdo completo)
+# ====== Google: modos de autenticação ======
+# (1) OAuth — cria cópias usando a SUA conta (recomendado)
+GOOGLE_USE_OAUTH = os.getenv("GOOGLE_USE_OAUTH", "0") == "1"
+GOOGLE_OAUTH_CLIENT_ID     = os.getenv("GOOGLE_OAUTH_CLIENT_ID")
+GOOGLE_OAUTH_CLIENT_SECRET = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET")
+GOOGLE_OAUTH_REDIRECT_URI  = os.getenv("GOOGLE_OAUTH_REDIRECT_URI")
+GOOGLE_OAUTH_SCOPES = (os.getenv("GOOGLE_OAUTH_SCOPES") or
+                       "https://www.googleapis.com/auth/drive https://www.googleapis.com/auth/spreadsheets").split()
+GOOGLE_TOKEN_PATH   = os.getenv("GOOGLE_TOKEN_PATH", "/tmp/google_oauth_token.json")
+OAUTH_STATE_SECRET  = os.getenv("OAUTH_STATE_SECRET", "change-me")
+
+# (2) Service Account — fallback para testes
 GOOGLE_SA_JSON = os.getenv("GOOGLE_SA_JSON")
 
-# IDs do modelo e pasta de destino (Google Drive)
-GS_TEMPLATE_ID = os.getenv("GS_TEMPLATE_ID")
+# ====== IDs do modelo e pasta de destino (Drive) ======
+GS_TEMPLATE_ID    = os.getenv("GS_TEMPLATE_ID")
 GS_DEST_FOLDER_ID = os.getenv("GS_DEST_FOLDER_ID")
 
 # Opções
-WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "Plan1")  # pode ser "🧾"
-SHARE_LINK_ROLE = os.getenv("SHARE_LINK_ROLE", "writer")  # writer|commenter|reader
-TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
+WORKSHEET_NAME   = os.getenv("WORKSHEET_NAME", "Plan1")  # pode ser "🧾"
+SHARE_LINK_ROLE  = os.getenv("SHARE_LINK_ROLE", "writer")  # writer|commenter|reader
 
-# Scopes Google
-SCOPES = [
+SCOPES_SA = [
     "https://www.googleapis.com/auth/drive",
     "https://www.googleapis.com/auth/spreadsheets",
 ]
@@ -59,10 +69,8 @@ def _now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 def licenses_db_init():
-    """Inicializa/atualiza o schema."""
     con = _db()
     cur = con.cursor()
-    # licenses
     cur.execute("""
     CREATE TABLE IF NOT EXISTS licenses (
         license_key TEXT PRIMARY KEY,
@@ -71,7 +79,6 @@ def licenses_db_init():
         expires_at TEXT,
         notes TEXT
     )""")
-    # clients
     cur.execute("""
     CREATE TABLE IF NOT EXISTS clients (
         chat_id TEXT PRIMARY KEY,
@@ -83,14 +90,12 @@ def licenses_db_init():
         last_seen_at TEXT,
         FOREIGN KEY (license_key) REFERENCES licenses(license_key)
     )""")
-    # usage log
     cur.execute("""
     CREATE TABLE IF NOT EXISTS usage (
         chat_id TEXT,
         event TEXT,
         ts TEXT
     )""")
-    # Conversa pendente (/start → licença → e-mail)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS pending (
         chat_id TEXT PRIMARY KEY,
@@ -98,12 +103,10 @@ def licenses_db_init():
         temp_license TEXT,
         created_at TEXT
     )""")
-    # Migrations simples (add colunas se faltarem)
     try:
         cur.execute("ALTER TABLE clients ADD COLUMN email TEXT")
     except Exception:
         pass
-
     con.commit()
     con.close()
 
@@ -160,13 +163,10 @@ def bind_license_to_chat(chat_id: str, license_key: str):
     if conflict:
         con.close()
         return False, "Essa licença já foi usada por outro Telegram."
-
-    con.execute("""
-        INSERT OR IGNORE INTO clients(chat_id, created_at) VALUES(?,?)
-    """, (str(chat_id), _now_iso()))
-    con.execute("""
-        UPDATE clients SET license_key=?, last_seen_at=? WHERE chat_id=?
-    """, (license_key, _now_iso(), str(chat_id)))
+    con.execute("""INSERT OR IGNORE INTO clients(chat_id, created_at) VALUES(?,?)""",
+                (str(chat_id), _now_iso()))
+    con.execute("""UPDATE clients SET license_key=?, last_seen_at=? WHERE chat_id=?""",
+                (license_key, _now_iso(), str(chat_id)))
     con.commit()
     con.close()
     return True, None
@@ -246,35 +246,82 @@ async def tg_send(chat_id, text):
         )
 
 # =========================================================
-# Google helpers (Service Account)
+# Google helpers — Auth
 # =========================================================
+def _client_config_dict():
+    return {
+        "web": {
+            "client_id": GOOGLE_OAUTH_CLIENT_ID,
+            "client_secret": GOOGLE_OAUTH_CLIENT_SECRET,
+            "redirect_uris": [GOOGLE_OAUTH_REDIRECT_URI],
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+        }
+    }
+
+def _save_credentials(creds: Credentials):
+    data = {
+        "token": creds.token,
+        "refresh_token": creds.refresh_token,
+        "token_uri": creds.token_uri,
+        "client_id": creds.client_id,
+        "client_secret": creds.client_secret,
+        "scopes": creds.scopes,
+    }
+    with open(GOOGLE_TOKEN_PATH, "w") as f:
+        json.dump(data, f)
+
+def _load_credentials() -> Credentials | None:
+    if not os.path.exists(GOOGLE_TOKEN_PATH):
+        return None
+    with open(GOOGLE_TOKEN_PATH, "r") as f:
+        data = json.load(f)
+    return Credentials.from_authorized_user_info(data, GOOGLE_OAUTH_SCOPES)
+
+def _oauth_services():
+    from google.auth.transport.requests import Request
+    creds = _load_credentials()
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            _save_credentials(creds)
+        else:
+            raise RuntimeError("Autorize primeiro em /oauth/start")
+    drive = build("drive", "v3", credentials=creds)
+    sheets = build("sheets", "v4", credentials=creds)
+    return drive, sheets
+
 def _load_sa_json_tolerant(raw: str) -> dict:
-    """
-    Permite colagens comuns no Render: com aspas externas, com escapes, etc.
-    """
     if not raw:
         raise RuntimeError("GOOGLE_SA_JSON não configurado.")
     s = raw.strip()
-    # remove aspas externas se existirem
     if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
         s = s[1:-1]
     try:
         return json.loads(s)
     except Exception:
-        # tenta decodificar escapes (\n, \") e reparsear
         try:
             s2 = bytes(s, "utf-8").decode("unicode_escape")
             return json.loads(s2)
         except Exception as e2:
             raise RuntimeError(f"Falha ao ler GOOGLE_SA_JSON: {e2}")
 
-def google_services():
+def _sa_services():
     info = _load_sa_json_tolerant(GOOGLE_SA_JSON)
-    creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+    creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES_SA)
     drive = build("drive", "v3", credentials=creds)
     sheets = build("sheets", "v4", credentials=creds)
     return drive, sheets
 
+def google_services():
+    # Usa OAuth (sua conta, 200GB) quando habilitado; senão, Service Account.
+    if GOOGLE_USE_OAUTH:
+        return _oauth_services()
+    return _sa_services()
+
+# =========================================================
+# Google helpers — Drive/Sheets
+# =========================================================
 def drive_find_in_folder(service, folder_id: str, name: str) -> Optional[str]:
     """Retorna o ID do arquivo com 'name' dentro da pasta 'folder_id', ou None."""
     safe_name = name.replace("'", "\\'")
@@ -310,14 +357,13 @@ def drive_create_anyone_link(file_id: str, role: str = "writer") -> str:
             body={"type": "anyone", "role": role},
             fields="id"
         ).execute()
-    except HttpError as e:
-        # Se já existir permissão 'anyone', alguns tenants retornam 403/409. Tentamos seguir assim mesmo.
+    except HttpError:
+        # se já existe a permissão 'anyone', alguns tenants retornam 403/409; seguimos
         pass
     meta = drive.files().get(fileId=file_id, fields="webViewLink").execute()
     return meta.get("webViewLink")
 
 def sheets_append_row(spreadsheet_id: str, sheet_name: str, values: List):
-    """Append de uma linha (8 colunas) no Google Sheets."""
     _, sheets = google_services()
     body = {"values": [values]}
     rng = f"{sheet_name}!A:H"
@@ -329,51 +375,8 @@ def sheets_append_row(spreadsheet_id: str, sheet_name: str, values: List):
         body=body
     ).execute()
 
-# ====== Utilitários de cota da Service Account (ADMIN) ======
-def sa_list_files(max_items=200):
-    drive, _ = google_services()
-    files = []
-    page_token = None
-    while True and len(files) < max_items:
-        res = drive.files().list(
-            q="trashed = false",
-            pageSize=min(1000, max_items - len(files)),
-            fields="nextPageToken, files(id,name,mimeType,owners,size)",
-            pageToken=page_token
-        ).execute()
-        files.extend(res.get("files", []))
-        page_token = res.get("nextPageToken")
-        if not page_token or len(files) >= max_items:
-            break
-    return files
-
-def sa_purge_all():
-    drive, _ = google_services()
-    page_token = None
-    deleted = 0
-    while True:
-        res = drive.files().list(
-            q="trashed = false",
-            pageSize=1000,
-            fields="nextPageToken, files(id,name)",
-            pageToken=page_token
-        ).execute()
-        items = res.get("files", [])
-        if not items:
-            break
-        for f in items:
-            try:
-                drive.files().delete(fileId=f["id"]).execute()
-                deleted += 1
-            except Exception as e:
-                print("erro delete", f["id"], f.get("name"), e)
-        page_token = res.get("nextPageToken")
-        if not page_token:
-            break
-    return deleted
-
 # =========================================================
-# NLP e Parsers
+# NLP — parsing de mensagens
 # =========================================================
 def parse_money(text: str) -> Optional[float]:
     m = re.search(r"(\d{1,3}(?:\.\d{3})*(?:,\d{2})|\d+(?:\.\d{2})?)", text)
@@ -388,10 +391,8 @@ def parse_money(text: str) -> Optional[float]:
 def parse_date(text: str) -> Optional[str]:
     t = text.lower()
     today = datetime.now().date()
-    if "hoje" in t:
-        return today.strftime("%Y-%m-%d")
-    if "ontem" in t:
-        return (today - timedelta(days=1)).strftime("%Y-%m-%d")
+    if "hoje" in t: return today.strftime("%Y-%m-%d")
+    if "ontem" in t: return (today - timedelta(days=1)).strftime("%Y-%m-%d")
     m = re.search(r"\b(\d{1,2})/(\d{1,2})(?:/(\d{4}))?\b", text)
     if m:
         d, mo, y = m.group(1), m.group(2), m.group(3) or str(today.year)
@@ -409,25 +410,18 @@ def detect_payment(text: str) -> str:
         brand = m.group(1).strip()
         brand = re.sub(r"\s+", " ", brand).strip()
         return f"💳 cartão {brand}"
-    if "pix" in t:
-        return "Pix"
-    if "dinheiro" in t or "cash" in t:
-        return "Dinheiro"
-    if "débito" in t or "debito" in t:
-        return "Débito"
-    if "crédito" in t or "credito" in t:
-        return "💳 cartão"
+    if "pix" in t: return "Pix"
+    if "dinheiro" in t or "cash" in t: return "Dinheiro"
+    if "débito" in t or "debito" in t: return "Débito"
+    if "crédito" in t or "credito" in t: return "💳 cartão"
     return "Outros"
 
 def detect_installments(text: str) -> str:
     t = text.lower()
     m = re.search(r"(\d{1,2})x", t)
-    if m:
-        return f"{m.group(1)}x"
-    if "parcelad" in t:
-        return "parcelado"
-    if "à vista" in t or "a vista" in t or "avista" in t:
-        return "à vista"
+    if m: return f"{m.group(1)}x"
+    if "parcelad" in t: return "parcelado"
+    if "à vista" in t or "a vista" in t or "avista" in t: return "à vista"
     return "à vista"
 
 CATEGORIES = {
@@ -458,7 +452,7 @@ def map_group(category: str) -> str:
     if category in ["Trocar de carro","Viagem pra Disney"]: return "Reserva"
     return "Gastos Variáveis"
 
-def detect_category_and_desc(text: str) -> Tuple[str, Optional[str]]:
+def detect_category_and_desc(text: str):
     t = text.lower()
     for cat, kws in CATEGORIES.items():
         for kw in kws:
@@ -487,14 +481,24 @@ def parse_natural(text: str) -> Tuple[Optional[List], Optional[str]]:
     return [data_iso, tipo, grupo, cat, (desc or ""), float(valor), forma, cond], None
 
 # =========================================================
-# Setup do arquivo por cliente (Google SA)
+# Provisionamento do arquivo por cliente
 # =========================================================
+def _ensure_unique_or_reuse(email: str) -> Optional[str]:
+    """Se já existe 'Lancamentos - <email>' na pasta destino, retorna id; senão None."""
+    if not GS_DEST_FOLDER_ID:
+        return None
+    drive, _ = google_services()
+    name = f"Lancamentos - {email}"
+    return drive_find_in_folder(drive, GS_DEST_FOLDER_ID, name)
+
+def drive_copy_and_link(email: str) -> Tuple[str, str]:
+    """Copia template, cria link 'anyone', retorna (file_id, webLink)."""
+    new_name = f"Lancamentos - {email}"
+    file_id = drive_copy_template(new_name)
+    link = drive_create_anyone_link(file_id, SHARE_LINK_ROLE)
+    return file_id, link
+
 async def setup_client_file(chat_id: str, email: str) -> Tuple[bool, Optional[str], Optional[str]]:
-    """
-    Cria (se necessário) a planilha do cliente e retorna (ok, erro, web_link).
-    - Reaproveita se já existir na pasta destino.
-    - Cria link 'anyone' (role = SHARE_LINK_ROLE).
-    """
     cli = get_client(chat_id)
     if cli and cli.get("item_id"):
         try:
@@ -503,12 +507,8 @@ async def setup_client_file(chat_id: str, email: str) -> Tuple[bool, Optional[st
             link = None
         return True, None, link
 
-    new_file_name = f"Lancamentos - {email}"
     try:
-        drive, _ = google_services()
-
-        # 1) Reaproveita se já existir um arquivo com esse nome na pasta destino
-        exist_id = drive_find_in_folder(drive, GS_DEST_FOLDER_ID, new_file_name) if GS_DEST_FOLDER_ID else None
+        exist_id = _ensure_unique_or_reuse(email)
         if exist_id:
             set_client_file(str(chat_id), exist_id)
             try:
@@ -517,19 +517,14 @@ async def setup_client_file(chat_id: str, email: str) -> Tuple[bool, Optional[st
                 link = None
             return True, None, link
 
-        # 2) Não existe → cria cópia do template
-        new_id = drive_copy_template(new_file_name)
-
-        # 3) Cria link público
-        web_link = drive_create_anyone_link(new_id, SHARE_LINK_ROLE)
+        new_id, web_link = drive_copy_and_link(email)
+        set_client_file(str(chat_id), new_id)
+        return True, None, web_link
 
     except HttpError as e:
         return False, f"Falha Google API: {e}", None
     except Exception as e:
         return False, f"Falha ao criar planilha: {e}", None
-
-    set_client_file(str(chat_id), new_id)
-    return True, None, web_link
 
 def add_row_to_client(values: List, chat_id: str):
     if len(values) != 8:
@@ -540,21 +535,50 @@ def add_row_to_client(values: List, chat_id: str):
     sheets_append_row(cli["item_id"], WORKSHEET_NAME, values)
 
 # =========================================================
-# Routes
+# Rotas
 # =========================================================
 @app.on_event("startup")
 def _startup():
     licenses_db_init()
     print(f"✅ DB pronto em {SQLITE_PATH}")
+    print(f"Auth mode: {'OAuth' if GOOGLE_USE_OAUTH else 'Service Account'}")
 
 @app.get("/")
 def root():
-    return {"status": "ok"}
+    return {"status": "ok", "auth_mode": "oauth" if GOOGLE_USE_OAUTH else "sa"}
 
 @app.get("/ping")
 def ping():
     return {"pong": True}
 
+# ===== Fluxo OAuth (apenas se você ativar GOOGLE_USE_OAUTH=1) =====
+@app.get("/oauth/start")
+def oauth_start():
+    if not GOOGLE_USE_OAUTH:
+        return HTMLResponse("<h3>OAuth desabilitado. Defina GOOGLE_USE_OAUTH=1.</h3>", status_code=400)
+    if not (GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET and GOOGLE_OAUTH_REDIRECT_URI):
+        return HTMLResponse("<h3>Faltam variáveis do OAuth no ambiente.</h3>", status_code=500)
+    flow = Flow.from_client_config(_client_config_dict(), scopes=GOOGLE_OAUTH_SCOPES, redirect_uri=GOOGLE_OAUTH_REDIRECT_URI)
+    auth_url, state = flow.authorization_url(access_type="offline", include_granted_scopes="true", prompt="consent", state=OAUTH_STATE_SECRET)
+    return RedirectResponse(auth_url)
+
+@app.get("/oauth2callback")
+def oauth_callback(code: str | None = None, state: str | None = None):
+    if not GOOGLE_USE_OAUTH:
+        return HTMLResponse("<h3>OAuth desabilitado. Defina GOOGLE_USE_OAUTH=1.</h3>", status_code=400)
+    if state != OAUTH_STATE_SECRET:
+        return HTMLResponse("<h3>State inválido.</h3>", status_code=400)
+    if not code:
+        return HTMLResponse("<h3>Faltou 'code'.</h3>", status_code=400)
+    flow = Flow.from_client_config(_client_config_dict(), scopes=GOOGLE_OAUTH_SCOPES, redirect_uri=GOOGLE_OAUTH_REDIRECT_URI)
+    flow.fetch_token(code=code)
+    creds = flow.credentials
+    if not creds.refresh_token:
+        return HTMLResponse("<h3>Não veio refresh_token. Refazer /oauth/start.</h3>", status_code=400)
+    _save_credentials(creds)
+    return HTMLResponse("<h3>✅ OAuth ok! Pode voltar ao Telegram.</h3>")
+
+# ===== Telegram Bot Webhook =====
 @app.post("/telegram/webhook")
 async def telegram_webhook(
     req: Request,
@@ -569,17 +593,14 @@ async def telegram_webhook(
     message = body.get("message") or {}
     chat_id = message.get("chat", {}).get("id")
     text = (message.get("text") or "").strip()
-
     if not chat_id or not text:
         return {"ok": True}
-
     chat_id_str = str(chat_id)
 
-    # ===== [ADMIN] comandos de licença e manutenção SA =====
+    # ===== Admin =====
     if ADMIN_TELEGRAM_ID and chat_id_str == ADMIN_TELEGRAM_ID:
         low = text.lower()
 
-        # /licenca nova [KEY] [DAYS]
         if low.startswith("/licenca nova"):
             parts = text.split()
             custom_key = None
@@ -599,19 +620,6 @@ async def telegram_webhook(
 
         if low.startswith("/licenca info"):
             await tg_send(chat_id, f"Seu ADMIN ID ({chat_id_str}) está correto. O bot está ativo.")
-            return {"ok": True}
-
-        if low.startswith("/sa listar"):
-            files = sa_list_files(300)
-            linhas = [f"- {f.get('name')} ({f.get('id')})" for f in files[:50]]
-            msg = "Arquivos (primeiros 50):\n" + ("\n".join(linhas) if linhas else "—") + f"\n\nTotal ~{len(files)}"
-            await tg_send(chat_id, msg if linhas else "Sem arquivos visíveis no Drive da SA.")
-            return {"ok": True}
-
-        if low.startswith("/sa limpar"):
-            await tg_send(chat_id, "Limpando todos os arquivos do Drive da SA (pode levar alguns segundos)...")
-            qtd = sa_purge_all()
-            await tg_send(chat_id, f"✅ Limpeza concluída. Removidos {qtd} arquivo(s).")
             return {"ok": True}
 
         if low.startswith("/licenca"):
@@ -661,20 +669,17 @@ async def telegram_webhook(
             await tg_send(chat_id, "Licença ok ✅\nAgora me diga seu *e-mail* (ex.: `cliente@gmail.com`).")
             return {"ok": True}
 
-        # temos email: segue configuração
         set_client_email(chat_id_str, email)
         await tg_send(chat_id, "✅ Obrigado! Configurando sua planilha de lançamentos...")
         okf, errf, link = await setup_client_file(chat_id_str, email)
         if not okf:
             await tg_send(chat_id, f"❌ {errf}")
             return {"ok": True}
-
         await tg_send(chat_id, f"🚀 Planilha configurada com sucesso!\n🔗 {link}")
-        await tg_send(chat_id,
-            "Tudo certo! Agora pode me contar seus gastos/recebimentos. Ex.: _gastei 45,90 no mercado via cartão hoje_")
+        await tg_send(chat_id, "Agora pode me contar seus gastos. Ex.: _gastei 45,90 no mercado via cartão hoje_")
         return {"ok": True}
 
-    # ========= Conversa pendente: aguardando licença ou e-mail =========
+    # ========= Conversa pendente =========
     step, temp_license = get_pending(chat_id_str)
     if step == "await_license":
         token = text.strip()
@@ -683,12 +688,10 @@ async def telegram_webhook(
         if not ok:
             await tg_send(chat_id, f"❌ Licença inválida: {err}\nTente novamente ou digite /cancel.")
             return {"ok": True}
-
         ok2, err2 = bind_license_to_chat(chat_id_str, token)
         if not ok2:
             await tg_send(chat_id, f"❌ {err2}\nTente novamente ou digite /cancel.")
             return {"ok": True}
-
         set_pending(chat_id_str, "await_email", token)
         await tg_send(chat_id, "Licença ok ✅\nAgora me diga seu *e-mail* (ex.: `cliente@gmail.com`).")
         return {"ok": True}
@@ -698,33 +701,28 @@ async def telegram_webhook(
         if not re.match(r"[^@]+@[^@]+\.[^@]+", email):
             await tg_send(chat_id, "❗ E-mail inválido. Tente novamente (ex.: `cliente@gmail.com`).")
             return {"ok": True}
-
         set_client_email(chat_id_str, email)
         set_pending(chat_id_str, None, None)
-
         await tg_send(chat_id, "✅ Obrigado! Configurando sua planilha de lançamentos...")
         okf, errf, link = await setup_client_file(chat_id_str, email)
         if not okf:
             await tg_send(chat_id, f"❌ {errf}")
             return {"ok": True}
-
         await tg_send(chat_id, f"🚀 Planilha configurada com sucesso!\n🔗 {link}")
-        await tg_send(chat_id,
-            "Tudo certo! Agora pode me contar seus gastos/recebimentos. Ex.: _gastei 45,90 no mercado via cartão hoje_")
+        await tg_send(chat_id, "Agora pode me contar seus gastos. Ex.: _gastei 45,90 no mercado via cartão hoje_")
         return {"ok": True}
 
-    # ===== exige licença para qualquer uso =====
+    # ===== exige licença =====
     ok, msg = require_active_license(chat_id_str)
     if not ok:
         await tg_send(chat_id, f"❗ {msg}")
         return {"ok": True}
 
-    # ===== Processamento de Lançamentos (NLP) =====
+    # ===== Lançamento =====
     row, err = parse_natural(text)
     if err:
         await tg_send(chat_id, f"❗ {err}")
         return {"ok": True}
-
     try:
         add_row_to_client(row, chat_id_str)
         await tg_send(chat_id, "✅ Lançado!")
