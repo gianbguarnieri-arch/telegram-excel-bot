@@ -476,18 +476,25 @@ def drive_copy_and_link(email: str) -> Tuple[str, str]:
 
 def sheets_append_row(spreadsheet_id: str, sheet_name: str, values: List):
     """
-    Append no intervalo B:I (configurável) a partir da primeira linha útil (8 por padrão).
+    Escreve a partir da primeira linha útil (SHEET_START_ROW) e primeira coluna útil (SHEET_FIRST_COL),
+    SEM inserir linhas novas, preservando validações/estilos da planilha.
     """
     _, sheets = google_services()
+
+    # Ex.: "🧾!B8:I"
     rng = f"{sheet_name}!{SHEET_FIRST_COL}{SHEET_START_ROW}:{SHEET_LAST_COL}"
+
     body = {"values": [values]}
+
+    # IMPORTANTE: usar OVERWRITE para não criar linha nova.
     sheets.spreadsheets().values().append(
         spreadsheetId=spreadsheet_id,
         range=rng,
         valueInputOption="USER_ENTERED",
-        insertDataOption="INSERT_ROWS",
+        insertDataOption="OVERWRITE",  # <- aqui está a diferença
         body=body
     ).execute()
+
 
 
 # =========================================================
