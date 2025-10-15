@@ -572,17 +572,17 @@ CATEGORIES = {
 
 def map_group(category: str) -> str:
     if category in ["Aluguel", "Água", "Energia", "Internet", "Plano de Saúde", "Escola", "Assinatura"]:
-        return "Gastos Fixos"
+        return "🏠Gastos Fixos"
     if category in ["Imposto", "Financiamento", "Empréstimo"]:
-        return "Despesas Temporárias"
+        return "🧾Despesas Temporárias"
     if category in ["Mercado", "Farmácia", "Combustível", "Passeio em família", "Ifood", "Viagem", "Restaurante"]:
-        return "Gastos Variáveis"
+        return "💸Gastos Variáveis"
     if category in ["Salário", "Vale", "Renda Extra 1", "Renda Extra 2", "Pró labore"]:
-        return "Ganhos"
+        return "💵Ganhos"
     if category in ["Renda Fixa", "Renda Variável", "Fundos imobiliários"]:
-        return "Investimento"
+        return "💰Investimento"
     if category in ["Trocar de carro", "Viagem pra Disney"]:
-        return "Reserva"
+        return "📝Reserva"
     return "Gastos Variáveis"
 
 def detect_category_and_desc(text: str):
@@ -610,7 +610,7 @@ def parse_natural(text: str) -> Tuple[Optional[List], Optional[str]]:
     forma = detect_payment(text)
     cond = detect_installments(text)
     cat, desc = detect_category_and_desc(text)
-    tipo = "Entrada" if re.search(r"\b(ganhei|recebi|sal[aá]rio|renda)\b", text.lower()) else "Saída"
+    tipo = "▲ Entrada" if re.search(r"\b(ganhei|recebi|sal[aá]rio|renda)\b", text.lower()) else "▼ Saída"
     grupo = map_group(cat)
     return [data_iso, tipo, grupo, cat, (desc or ""), float(valor), forma, cond], None
 
