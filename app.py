@@ -1,7 +1,6 @@
 import os
 import re
 import json
-import sqlite3
 import secrets
 import string
 import logging
@@ -12,57 +11,53 @@ import httpx
 from fastapi import FastAPI, Request, Header
 from fastapi.responses import HTMLResponse, RedirectResponse
 
-# Google APIs
+# Google APIs (inalterado)
 from google.oauth2 import service_account
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-# ===========================
-# Log
-# ===========================
+# ====== PostgreSQL ======
+import psycopg2
+import psycopg2.extras
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ===========================
-# FastAPI
-# ===========================
 app = FastAPI()
 
-# ===========================
-# ENVs
-# ===========================
+# =========================================================
+# ENVs (Telegram + Google)
+# =========================================================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID")
 TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
 
-SQLITE_PATH = os.getenv("SQLITE_PATH", "/tmp/db.sqlite")
+# >>> NOVO: Postgres (Neon)
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL não configurado. Defina essa variável no Render.")
 
-# Google Auth: OAuth (sua conta) ou Service Account
+# ====== Google: modos de autenticação ======
 GOOGLE_USE_OAUTH = os.getenv("GOOGLE_USE_OAUTH", "0") == "1"
-
 GOOGLE_OAUTH_CLIENT_ID     = os.getenv("GOOGLE_OAUTH_CLIENT_ID")
 GOOGLE_OAUTH_CLIENT_SECRET = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET")
 GOOGLE_OAUTH_REDIRECT_URI  = os.getenv("GOOGLE_OAUTH_REDIRECT_URI")
 GOOGLE_OAUTH_SCOPES = (os.getenv("GOOGLE_OAUTH_SCOPES") or
                        "https://www.googleapis.com/auth/drive https://www.googleapis.com/auth/spreadsheets").split()
-GOOGLE_TOKEN_PATH = os.getenv("GOOGLE_TOKEN_PATH", "/tmp/google_oauth_token.json")
+GOOGLE_TOKEN_PATH  = os.getenv("GOOGLE_TOKEN_PATH", "/tmp/google_oauth_token.json")
 OAUTH_STATE_SECRET = os.getenv("OAUTH_STATE_SECRET", "change-me")
 
-GOOGLE_SA_JSON = os.getenv("GOOGLE_SA_JSON")  # caso use Service Account
+# (2) Service Account — fallback
+GOOGLE_SA_JSON = os.getenv("GOOGLE_SA_JSON")
 
-# IDs do modelo e pasta (Drive)
+# ====== IDs do modelo e pasta de destino (Drive) ======
 GS_TEMPLATE_ID    = os.getenv("GS_TEMPLATE_ID")
 GS_DEST_FOLDER_ID = os.getenv("GS_DEST_FOLDER_ID")
 
-# Planilha de lançamentos (aba/intervalo)
-WORKSHEET_NAME   = os.getenv("WORKSHEET_NAME", "🧾")
-SHEET_FIRST_COL  = os.getenv("SHEET_FIRST_COL", "B")
-SHEET_LAST_COL   = os.getenv("SHEET_LAST_COL", "I")
-SHEET_START_ROW  = int(os.getenv("SHEET_START_ROW", "8"))
-
-# Compartilhamento
+# Opções
+WORKSHEET_NAME   = os.getenv("WORKSHEET_NAME", "Plan1")  # você pode pôr "🧾" aqui
 SHARE_LINK_ROLE  = os.getenv("SHARE_LINK_ROLE", "writer")  # writer|commenter|reader
 
 SCOPES_SA = [
@@ -70,62 +65,70 @@ SCOPES_SA = [
     "https://www.googleapis.com/auth/spreadsheets",
 ]
 
-# ===========================
-# DB
-# ===========================
-def _db():
-    return sqlite3.connect(SQLITE_PATH)
+# =========================================================
+# DB helpers (PostgreSQL)
+# =========================================================
+def pg_conn():
+    # autocommit=True simplifica updates/insert sem precisar chamar commit em todo lugar
+    conn = psycopg2.connect(DATABASE_URL, sslmode="require")
+    conn.autocommit = True
+    return conn
+
+def licenses_db_init():
+    """Cria o schema necessário no Postgres (idempotente)."""
+    ddl = [
+        """
+        CREATE TABLE IF NOT EXISTS licenses (
+            license_key   TEXT PRIMARY KEY,
+            status        TEXT NOT NULL DEFAULT 'active',
+            max_files     INTEGER NOT NULL DEFAULT 1,
+            expires_at    TIMESTAMPTZ,
+            notes         TEXT
+        );
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS clients (
+            chat_id     TEXT PRIMARY KEY,
+            license_key TEXT REFERENCES licenses(license_key),
+            email       TEXT,
+            file_scope  TEXT,
+            item_id     TEXT,
+            created_at  TIMESTAMPTZ,
+            last_seen_at TIMESTAMPTZ
+        );
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS usage_log (
+            chat_id TEXT,
+            event   TEXT,
+            ts      TIMESTAMPTZ
+        );
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS pending (
+            chat_id      TEXT PRIMARY KEY,
+            step         TEXT,
+            temp_license TEXT,
+            created_at   TIMESTAMPTZ
+        );
+        """
+    ]
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            for q in ddl:
+                cur.execute(q)
+    logger.info("✅ Postgres schema pronto.")
 
 def _now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
-def licenses_db_init():
-    con = _db()
-    cur = con.cursor()
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS licenses (
-        license_key TEXT PRIMARY KEY,
-        status TEXT NOT NULL DEFAULT 'active',
-        max_files INTEGER NOT NULL DEFAULT 1,
-        expires_at TEXT,
-        notes TEXT
-    )""")
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS clients (
-        chat_id TEXT PRIMARY KEY,
-        license_key TEXT,
-        email TEXT,
-        file_scope TEXT,
-        item_id TEXT,
-        created_at TEXT,
-        last_seen_at TEXT,
-        FOREIGN KEY (license_key) REFERENCES licenses(license_key)
-    )""")
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS usage (
-        chat_id TEXT,
-        event TEXT,
-        ts TEXT
-    )""")
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS pending (
-        chat_id TEXT PRIMARY KEY,
-        step TEXT,            -- 'await_license' | 'await_email'
-        temp_license TEXT,
-        created_at TEXT
-    )""")
-    try:
-        cur.execute("ALTER TABLE clients ADD COLUMN email TEXT")
-    except Exception:
-        pass
-    con.commit()
-    con.close()
-
 def record_usage(chat_id, event):
-    con = _db()
-    con.execute("INSERT INTO usage(chat_id, event, ts) VALUES(?,?,?)",
-                (str(chat_id), event, _now_iso()))
-    con.commit(); con.close()
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO usage_log(chat_id, event, ts) VALUES (%s,%s, %s)",
+                (str(chat_id), event, datetime.now(timezone.utc))
+            )
 
 def _gen_key(prefix="GF"):
     alphabet = string.ascii_uppercase + string.digits
@@ -134,22 +137,32 @@ def _gen_key(prefix="GF"):
 
 def create_license(days: Optional[int] = 30, max_files: int = 1, notes: Optional[str] = None, custom_key: Optional[str] = None):
     key = custom_key or _gen_key()
-    expires_at = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat(timespec="seconds") if days else None
-    con = _db()
-    con.execute("INSERT INTO licenses(license_key,status,max_files,expires_at,notes) VALUES(?,?,?,?,?)",
-                (key, "active", max_files, expires_at, notes))
-    con.commit(); con.close()
-    return key, expires_at
+    expires_at = (datetime.now(timezone.utc) + timedelta(days=days)) if days else None
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO licenses(license_key,status,max_files,expires_at,notes) VALUES(%s,%s,%s,%s,%s)",
+                (key, "active", max_files, expires_at, notes)
+            )
+    return key, expires_at.isoformat(timespec="seconds") if expires_at else None
 
 def get_license(license_key: str):
-    con = _db()
-    cur = con.execute("SELECT license_key,status,max_files,expires_at,notes FROM licenses WHERE license_key=?",
-                      (license_key,))
-    row = cur.fetchone()
-    con.close()
+    with pg_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            cur.execute(
+                "SELECT license_key,status,max_files,expires_at,notes FROM licenses WHERE license_key=%s",
+                (license_key,)
+            )
+            row = cur.fetchone()
     if not row:
         return None
-    return {"license_key": row[0], "status": row[1], "max_files": row[2], "expires_at": row[3], "notes": row[4]}
+    return {
+        "license_key": row["license_key"],
+        "status": row["status"],
+        "max_files": row["max_files"],
+        "expires_at": row["expires_at"].isoformat(timespec="seconds") if row["expires_at"] else None,
+        "notes": row["notes"]
+    }
 
 def is_license_valid(lic: dict):
     if not lic:
@@ -165,67 +178,89 @@ def is_license_valid(lic: dict):
     return True, None
 
 def bind_license_to_chat(chat_id: str, license_key: str):
-    con = _db()
-    cur = con.execute("SELECT chat_id FROM clients WHERE license_key=? AND chat_id<>? LIMIT 1",
-                      (license_key, str(chat_id)))
-    conflict = cur.fetchone()
-    if conflict:
-        con.close()
-        return False, "Essa licença já foi usada por outro Telegram."
-    con.execute("""INSERT OR IGNORE INTO clients(chat_id, created_at) VALUES(?,?)""",
-                (str(chat_id), _now_iso()))
-    con.execute("""UPDATE clients SET license_key=?, last_seen_at=? WHERE chat_id=?""",
-                (license_key, _now_iso(), str(chat_id)))
-    con.commit(); con.close()
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            # Verifica se essa licença já está vinculada a outro chat
+            cur.execute("SELECT chat_id FROM clients WHERE license_key=%s AND chat_id<>%s LIMIT 1",
+                        (license_key, str(chat_id)))
+            conflict = cur.fetchone()
+            if conflict:
+                return False, "Essa licença já foi usada por outro Telegram."
+            # upsert do cliente
+            cur.execute(
+                """
+                INSERT INTO clients(chat_id, created_at, last_seen_at)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (chat_id) DO NOTHING
+                """,
+                (str(chat_id), datetime.now(timezone.utc), datetime.now(timezone.utc))
+            )
+            cur.execute(
+                "UPDATE clients SET license_key=%s, last_seen_at=%s WHERE chat_id=%s",
+                (license_key, datetime.now(timezone.utc), str(chat_id))
+            )
     return True, None
 
 def get_client(chat_id: str):
-    con = _db()
-    cur = con.execute("""SELECT chat_id, license_key, email, file_scope, item_id, created_at, last_seen_at
-                         FROM clients WHERE chat_id=?""", (str(chat_id),))
-    row = cur.fetchone()
-    con.close()
+    with pg_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            cur.execute(
+                """SELECT chat_id, license_key, email, file_scope, item_id, created_at, last_seen_at
+                   FROM clients WHERE chat_id=%s""",
+                (str(chat_id),)
+            )
+            row = cur.fetchone()
     if not row:
         return None
     return {
-        "chat_id": row[0],
-        "license_key": row[1],
-        "email": row[2],
-        "file_scope": row[3],
-        "item_id": row[4],
-        "created_at": row[5],
-        "last_seen_at": row[6],
+        "chat_id": row["chat_id"],
+        "license_key": row["license_key"],
+        "email": row["email"],
+        "file_scope": row["file_scope"],
+        "item_id": row["item_id"],
+        "created_at": row["created_at"].isoformat(timespec="seconds") if row["created_at"] else None,
+        "last_seen_at": row["last_seen_at"].isoformat(timespec="seconds") if row["last_seen_at"] else None,
     }
 
 def set_client_email(chat_id: str, email: str):
-    con = _db()
-    con.execute("UPDATE clients SET email=?, last_seen_at=? WHERE chat_id=?",
-                (email, _now_iso(), str(chat_id)))
-    con.commit(); con.close()
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE clients SET email=%s, last_seen_at=%s WHERE chat_id=%s",
+                (email, datetime.now(timezone.utc), str(chat_id))
+            )
 
 def set_client_file(chat_id: str, item_id: str):
-    con = _db()
-    con.execute("""UPDATE clients SET file_scope=?, item_id=?, last_seen_at=? WHERE chat_id=?""",
-                ("google", item_id, _now_iso(), str(chat_id)))
-    con.commit(); con.close()
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE clients SET file_scope=%s, item_id=%s, last_seen_at=%s WHERE chat_id=%s",
+                ("google", item_id, datetime.now(timezone.utc), str(chat_id))
+            )
 
 def set_pending(chat_id: str, step: Optional[str], temp_license: Optional[str]):
-    con = _db()
-    if step:
-        con.execute("""
-            INSERT INTO pending(chat_id, step, temp_license, created_at)
-            VALUES(?,?,?,?)
-            ON CONFLICT(chat_id) DO UPDATE SET step=excluded.step, temp_license=excluded.temp_license, created_at=excluded.created_at
-        """, (str(chat_id), step, temp_license, _now_iso()))
-    else:
-        con.execute("DELETE FROM pending WHERE chat_id=?", (str(chat_id),))
-    con.commit(); con.close()
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            if step:
+                cur.execute(
+                    """
+                    INSERT INTO pending(chat_id, step, temp_license, created_at)
+                    VALUES(%s,%s,%s,%s)
+                    ON CONFLICT (chat_id) DO UPDATE SET
+                        step=EXCLUDED.step,
+                        temp_license=EXCLUDED.temp_license,
+                        created_at=EXCLUDED.created_at
+                    """,
+                    (str(chat_id), step, temp_license, datetime.now(timezone.utc))
+                )
+            else:
+                cur.execute("DELETE FROM pending WHERE chat_id=%s", (str(chat_id),))
 
 def get_pending(chat_id: str):
-    con = _db()
-    cur = con.execute("SELECT step, temp_license FROM pending WHERE chat_id=?", (str(chat_id),))
-    row = cur.fetchone()
-    con.close()
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT step, temp_license FROM pending WHERE chat_id=%s", (str(chat_id),))
+            row = cur.fetchone()
     if not row:
         return None, None
     return row[0], row[1]
@@ -240,9 +275,10 @@ def require_active_license(chat_id: str):
         return False, f"Licença inválida: {err}\nFale com o suporte para renovar/ativar."
     return True, None
 
-# ===========================
+
+# =========================================================
 # Telegram helper
-# ===========================
+# =========================================================
 async def tg_send(chat_id, text):
     async with httpx.AsyncClient(timeout=12) as client:
         try:
@@ -256,9 +292,9 @@ async def tg_send(chat_id, text):
         except httpx.RequestError as e:
             logger.error(f"Falha ao enviar msg ao Telegram (Request): {e}")
 
-# ===========================
-# Google Auth helpers
-# ===========================
+# =========================================================
+# Google helpers — Auth (inalterado)
+# =========================================================
 def _client_config_dict():
     return {
         "web": {
@@ -327,19 +363,15 @@ def _sa_services():
     return drive, sheets
 
 def google_services():
-    if GOOGLE_USE_OAUTH:
-        return _oauth_services()
-    return _sa_services()
+    return _oauth_services() if GOOGLE_USE_OAUTH else _sa_services()
 
-# ===========================
-# Google Drive/Sheets helpers
-# ===========================
+# =========================================================
+# Google helpers — Drive/Sheets (inalterado)
+# =========================================================
 def drive_find_in_folder(service, folder_id: str, name: str) -> Optional[str]:
     safe_name = name.replace("'", "\\'")
     q = f"name = '{safe_name}' and '{folder_id}' in parents and trashed = false"
-    res = service.files().list(
-        q=q, spaces="drive", fields="files(id,name)", pageSize=1
-    ).execute()
+    res = service.files().list(q=q, spaces="drive", fields="files(id,name)", pageSize=1).execute()
     files = res.get("files", [])
     return files[0]["id"] if files else None
 
@@ -377,27 +409,25 @@ def drive_copy_and_link(email: str) -> Tuple[str, str]:
     return file_id, link
 
 def sheets_append_row(spreadsheet_id: str, sheet_name: str, values: List):
-    """
-    Escreve SEM inserir linhas novas (preserva formatação/validação a partir da linha 8).
-    Intervalo: ex. "🧾!B8:I"
-    """
     _, sheets = google_services()
-    rng = f"{sheet_name}!{SHEET_FIRST_COL}{SHEET_START_ROW}:{SHEET_LAST_COL}"
     body = {"values": [values]}
+    # Mantém o append (Sheets decide a próxima linha dentro do range da planilha)
+    rng = f"{sheet_name}!A:H"  # ajuste aqui se sua planilha começar em outra coluna/aba
     sheets.spreadsheets().values().append(
         spreadsheetId=spreadsheet_id,
         range=rng,
         valueInputOption="USER_ENTERED",
-        insertDataOption="OVERWRITE",  # não insere linha; escreve na próxima vazia da faixa
+        insertDataOption="INSERT_ROWS",
         body=body
     ).execute()
 
-# ===========================
-# NLP / Parsing
-# ===========================
+# =========================================================
+# NLP e Parsers (igual ao que você já usava)
+# =========================================================
 def parse_money(text: str) -> Optional[float]:
     m = re.search(r"(\d{1,3}(?:\.\d{3})*(?:,\d{2})|\d+(?:\.\d{2})?)", text)
-    if not m: return None
+    if not m:
+        return None
     val = m.group(1).replace(".", "").replace(",", ".")
     try:
         return float(val)
@@ -407,189 +437,116 @@ def parse_money(text: str) -> Optional[float]:
 def parse_date(text: str) -> Optional[str]:
     t = text.lower()
     today = datetime.now().date()
-    if "hoje" in t: return today.strftime("%Y-%m-%d")
-    if "ontem" in t: return (today - timedelta(days=1)).strftime("%Y-%m-%d")
+    if "hoje" in t:
+        return today.strftime("%Y-%m-%d")
+    if "ontem" in t:
+        return (today - timedelta(days=1)).strftime("%Y-%m-%d")
     m = re.search(r"\b(\d{1,2})/(\d{1,2})(?:/(\d{4}))?\b", text)
     if m:
         d, mo, y = m.group(1), m.group(2), m.group(3) or str(today.year)
         try:
             dt = datetime.strptime(f"{d}/{mo}/{y}", "%d/%m/%Y").date()
             return dt.strftime("%Y-%m-%d")
-        except: return None
+        except:
+            return None
     return None
-
-# ===== Grupos com ícones =====
-GROUP_EMOJI = {
-    "GASTOS_FIXOS":      "🏠 Gastos Fixos",
-    "ASSINATURA":        "📺 Assinatura",
-    "GASTOS_VARIAVEIS":  "💸 Gastos Variáveis",
-    "DESPESAS_TEMP":     "🧾 Despesas Temporárias",
-    "PAG_FATURA":        "💳 Pagamento de Fatura",
-    "GANHOS":            "💵 Ganhos",
-    "INVESTIMENTO":      "💰 Investimento",
-    "RESERVA":           "📝 Reserva",
-    "SAQUE_RESGATE":     "💲 Saque/Resgate",
-}
-
-TRAILING_STOP = {
-    "hoje", "ontem", "amanha", "amanhã", "agora", "hj",
-    "via", "no", "na", "em", "de", "do", "da", "e",
-    "pix", "débito", "debito", "crédito", "credito"
-}
-
-ASSINATURAS = {
-    "netflix": "Netflix",
-    "spotify": "Spotify",
-    "disney": "Disney+",
-    "amazon prime": "Amazon Prime",
-    "prime video": "Amazon Prime",
-    "globoplay": "Globoplay",
-    "hbo": "HBO",
-    "max": "Max",
-    "apple tv": "Apple TV+",
-    "youtube premium": "YouTube Premium",
-}
-
-KEYWORDS_FIXOS = {"aluguel", "condomínio", "condominio", "luz", "energia", "água", "agua", "internet"}
-KEYWORDS_TEMP = {"iptu", "ipva", "multa", "empréstimo", "emprestimo"}
-KEYWORDS_VARIAVEIS = {"mercado", "farmácia", "farmacia", "combustível", "combustivel", "restaurante", "lanche",
-                      "pizza", "hamburguer", "sushi", "ifood", "cinema", "passeio", "hotel", "viagem"}
-KEYWORDS_GANHOS = {"salário", "salario", "recebi", "ganhei", "renda", "pró labore", "pro labore"}
-
-def _titlecase(s: str) -> str:
-    return " ".join(w.capitalize() for w in s.split())
-
-def _clean_trailing_tokens(s: str) -> str:
-    tokens = s.split()
-    while tokens and tokens[-1].lower() in TRAILING_STOP:
-        tokens.pop()
-    return " ".join(tokens).strip()
 
 def detect_payment(text: str) -> str:
     t = text.lower()
     m = re.search(r"cart[aã]o\s+([a-z0-9 ]+)", t)
     if m:
-        brand = _clean_trailing_tokens(m.group(1))
+        brand = m.group(1).strip()
         brand = re.sub(r"\s+", " ", brand).strip()
-        if brand:
-            return f"💳 cartão {_titlecase(brand)}"
+        # remove "hoje"/"ontem" acidental no nome do cartão
+        brand = re.sub(r"\b(hoje|ontem)\b", "", brand).strip()
+        return f"💳 cartão {brand}" if brand else "💳 cartão"
+    if "pix" in t:
+        return "Pix"
+    if "dinheiro" in t or "cash" in t:
+        return "Dinheiro"
+    if "débito" in t or "debito" in t:
+        return "Débito"
+    if "crédito" in t or "credito" in t:
         return "💳 cartão"
-    if "pix" in t: return "Pix"
-    if "dinheiro" in t or "cash" in t: return "Dinheiro"
-    if "débito" in t or "debito" in t: return "Débito"
-    if "crédito" in t or "credito" in t: return "Crédito"
     return "Outros"
-
-def _detect_pagamento_fatura(text: str):
-    t = text.lower()
-    m = re.search(r"pague[iu]\s+a?\s*fatura\s+do?\s+cart[aã]o\s+([a-z0-9 ]+)", t)
-    if m:
-        brand = _clean_trailing_tokens(m.group(1))
-        if brand:
-            return GROUP_EMOJI["PAG_FATURA"], f"Cartão {_titlecase(brand)}"
-        return GROUP_EMOJI["PAG_FATURA"], "Cartão"
-    return None, None
-
-def _detect_saque_resgate(text: str):
-    t = text.lower()
-    if any(w in t for w in ["saquei", "saque", "resgatei", "resgate"]):
-        origem = None
-        m = re.search(r"(?:do|da|de)\s+([a-z0-9 ]+)", t)
-        if m:
-            origem = _clean_trailing_tokens(m.group(1))
-            origem = _titlecase(origem)
-        return GROUP_EMOJI["SAQUE_RESGATE"], (origem or "Saque/Resgate")
-    return None, None
-
-def detect_group_and_category(text: str) -> Tuple[str, str]:
-    t = text.lower()
-
-    grp, cat = _detect_pagamento_fatura(text)
-    if grp: return grp, cat
-
-    grp, cat = _detect_saque_resgate(text)
-    if grp: return grp, cat
-
-    for k, display in ASSINATURAS.items():
-        if k in t:
-            return GROUP_EMOJI["ASSINATURA"], display
-
-    if any(w in t for w in KEYWORDS_GANHOS):
-        return GROUP_EMOJI["GANHOS"], "Ganhos"
-
-    if any(w in t for w in KEYWORDS_FIXOS):
-        for w in KEYWORDS_FIXOS:
-            if w in t:
-                return GROUP_EMOJI["GASTOS_FIXOS"], _titlecase(w)
-        return GROUP_EMOJI["GASTOS_FIXOS"], "Gasto Fixo"
-
-    if any(w in t for w in KEYWORDS_TEMP):
-        for w in KEYWORDS_TEMP:
-            if w in t:
-                return GROUP_EMOJI["DESPESAS_TEMP"], _titlecase(w)
-        return GROUP_EMOJI["DESPESAS_TEMP"], "Despesa Temporária"
-
-    if any(w in t for w in KEYWORDS_VARIAVEIS):
-        for w in KEYWORDS_VARIAVEIS:
-            if w in t:
-                return GROUP_EMOJI["GASTOS_VARIAVEIS"], _titlecase(w)
-        return GROUP_EMOJI["GASTOS_VARIAVEIS"], "Gasto Variável"
-
-    if "aporte" in t or "investi" in t or "comprei ação" in t or "comprei acoes" in t:
-        return GROUP_EMOJI["INVESTIMENTO"], "Aporte"
-    if "reserva" in t or "meta" in t or "objetivo" in t:
-        return GROUP_EMOJI["RESERVA"], "Reserva"
-
-    return GROUP_EMOJI["GASTOS_VARIAVEIS"], "Outros"
 
 def detect_installments(text: str) -> str:
     t = text.lower()
     m = re.search(r"(\d{1,2})x", t)
-    if m: return f"{m.group(1)}x"
-    if "parcelad" in t: return "parcelado"
-    if "à vista" in t or "a vista" in t or "avista" in t: return "à vista"
+    if m:
+        return f"{m.group(1)}x"
+    if "parcelad" in t:
+        return "parcelado"
+    if "à vista" in t or "a vista" in t or "avista" in t:
+        return "à vista"
     return "à vista"
+
+CATEGORIES = {
+    "Restaurante": ["restaurante", "almoço", "jantar", "lanche", "pizza", "hamburg", "sushi"],
+    "Mercado": ["mercado", "supermercado", "compras de mercado", "rancho", "hortifruti"],
+    "Farmácia": ["farmácia", "remédio", "medicamento", "drogaria"],
+    "Combustível": ["gasolina", "álcool", "etanol", "diesel", "posto", "combustível"],
+    "Ifood": ["ifood", "i-food"],
+    "Passeio em família": ["passeio", "parque", "cinema", "lazer"],
+    "Viagem": ["hotel", "passagem", "viagem", "airbnb"],
+    "Assinatura": ["netflix", "amazon", "disney", "spotify", "premiere"],
+    "Aluguel": ["aluguel", "condomínio"],
+    "Água": ["água", "sabesp"],
+    "Energia": ["energia", "luz"],
+    "Internet": ["internet", "banda larga", "fibra"],
+    "Plano de Saúde": ["plano de saúde", "unimed", "amil"],
+    "Escola": ["escola", "mensalidade", "faculdade", "curso"],
+    "Imposto": ["iptu", "ipva"],
+    "Financiamento": ["financiamento", "parcela do carro", "parcela da casa"],
+}
+
+def map_group(category: str) -> str:
+    if category in ["Aluguel", "Água", "Energia", "Internet", "Plano de Saúde", "Escola", "Assinatura"]:
+        return "Gastos Fixos"
+    if category in ["Imposto", "Financiamento", "Empréstimo"]:
+        return "Despesas Temporárias"
+    if category in ["Mercado", "Farmácia", "Combustível", "Passeio em família", "Ifood", "Viagem", "Restaurante"]:
+        return "Gastos Variáveis"
+    if category in ["Salário", "Vale", "Renda Extra 1", "Renda Extra 2", "Pró labore"]:
+        return "Ganhos"
+    if category in ["Renda Fixa", "Renda Variável", "Fundos imobiliários"]:
+        return "Investimento"
+    if category in ["Trocar de carro", "Viagem pra Disney"]:
+        return "Reserva"
+    return "Gastos Variáveis"
+
+def detect_category_and_desc(text: str):
+    t = text.lower()
+    for cat, kws in CATEGORIES.items():
+        for kw in kws:
+            if kw in t:
+                m = re.search(r"(comprei|paguei|gastei)\s+(.*?)(?:\s+na\s+|\s+no\s+|\s+via\s+|$)", t)
+                desc = None
+                if m:
+                    raw = m.group(2)
+                    raw = re.sub(r"\d{1,3}(?:\.\d{3})*(?:,\d{2})|\d+(?:\.\d{2})?", "", raw)
+                    raw = re.sub(r"\b(hoje|ontem|\d{1,2}/\d{1,2}(?:/\d{4})?)\b", "", raw)
+                    raw = raw.strip(" .,-")
+                    if raw and len(raw) < 60:
+                        desc = raw
+                return cat, (desc if desc else None)
+    return "Outros", None
 
 def parse_natural(text: str) -> Tuple[Optional[List], Optional[str]]:
     valor = parse_money(text)
     if valor is None:
         return None, "Não achei o valor. Ex.: 45,90"
-
     data_iso = parse_date(text) or datetime.now().strftime("%Y-%m-%d")
     forma = detect_payment(text)
     cond = detect_installments(text)
+    cat, desc = detect_category_and_desc(text)
+    tipo = "▲ Entrada" if re.search(r"\b(ganhei|recebi|sal[aá]rio|renda)\b", text.lower()) else "▼ Saída"
+    grupo = map_group(cat)
+    return [data_iso, tipo, grupo, cat, (desc or ""), float(valor), forma, cond], None
 
-    group, category = detect_group_and_category(text)
-    t_low = text.lower()
-
-    # Tipo com ícones
-    if group == GROUP_EMOJI["SAQUE_RESGATE"]:
-        tipo = "▲ Entrada"
-    elif group == GROUP_EMOJI["GANHOS"] or re.search(r"\b(ganhei|recebi|sal[aá]rio|renda)\b", t_low):
-        tipo = "▲ Entrada"
-    else:
-        tipo = "▼ Saída"
-
-    # Descrição curta
-    desc = None
-    m = re.search(r"(comprei|paguei|gastei)\s+(.*?)(?:\s+na\s+|\s+no\s+|\s+via\s+|$)", t_low)
-    if m:
-        raw = m.group(2)
-        raw = re.sub(r"\d{1,3}(?:\.\d{3})*(?:,\d{2})|\d+(?:\.\d{2})?", "", raw)
-        raw = re.sub(r"\b(hoje|ontem|\d{1,2}/\d{1,2}(?:/\d{4})?)\b", "", raw)
-        raw = raw.strip(" .,-")
-        if raw and len(raw) < 60:
-            desc = _titlecase(raw)
-
-    # Pagamento de fatura → descrição vazia
-    if group == GROUP_EMOJI["PAG_FATURA"]:
-        desc = ""
-
-    return [data_iso, tipo, group, category, (desc or ""), float(valor), forma, cond], None
-
-# ===========================
-# Provisionamento (Google)
-# ===========================
+# =========================================================
+# Provisionamento por cliente
+# =========================================================
 def _ensure_unique_or_reuse(email: str) -> Optional[str]:
     if not GS_DEST_FOLDER_ID:
         return None
@@ -635,13 +592,13 @@ def add_row_to_client(values: List, chat_id: str):
         raise RuntimeError("Planilha do cliente não configurada.")
     sheets_append_row(cli["item_id"], WORKSHEET_NAME, values)
 
-# ===========================
+# =========================================================
 # Rotas
-# ===========================
+# =========================================================
 @app.on_event("startup")
 def _startup():
     licenses_db_init()
-    print(f"✅ DB pronto em {SQLITE_PATH}")
+    logger.info("✅ DB inicializado (Postgres).")
     print(f"Auth mode: {'OAuth' if GOOGLE_USE_OAUTH else 'Service Account'}")
 
 @app.get("/")
@@ -652,7 +609,7 @@ def root():
 def ping():
     return {"pong": True}
 
-# ---- OAuth flow (se usar GOOGLE_USE_OAUTH=1) ----
+# ===== Fluxo OAuth =====
 @app.get("/oauth/start")
 def oauth_start():
     if not GOOGLE_USE_OAUTH:
@@ -664,7 +621,7 @@ def oauth_start():
     return RedirectResponse(auth_url)
 
 @app.get("/oauth/callback")
-def oauth_callback(code: str | None = None, state: str | None = None):
+def oauth_callback(code: Optional[str] = None, state: Optional[str] = None):
     if not GOOGLE_USE_OAUTH:
         return HTMLResponse("<h3>OAuth desabilitado. Defina GOOGLE_USE_OAUTH=1.</h3>", status_code=400)
     if state != OAUTH_STATE_SECRET:
@@ -679,7 +636,7 @@ def oauth_callback(code: str | None = None, state: str | None = None):
     _save_credentials(creds)
     return HTMLResponse("<h3>✅ OAuth ok! Pode voltar ao Telegram.</h3>")
 
-# ---- Telegram webhook ----
+# ===== Telegram Bot Webhook =====
 @app.post("/telegram/webhook")
 async def telegram_webhook(
     req: Request,
@@ -697,9 +654,10 @@ async def telegram_webhook(
         return {"ok": True}
     chat_id_str = str(chat_id)
 
-    # Admin
+    # ===== Admin =====
     if ADMIN_TELEGRAM_ID and chat_id_str == ADMIN_TELEGRAM_ID:
         low = text.lower()
+
         if low.startswith("/licenca nova"):
             parts = text.split()
             custom_key = None
@@ -725,13 +683,13 @@ async def telegram_webhook(
             await tg_send(chat_id, "Comando de licença não reconhecido ou incompleto.")
             return {"ok": True}
 
-    # /cancel
+    # ========= /cancel =========
     if text.lower() == "/cancel":
         set_pending(chat_id_str, None, None)
         await tg_send(chat_id, "Operação cancelada. Envie /start para começar novamente.")
         return {"ok": True}
 
-    # /start amigável
+    # ========= /start =========
     if text.lower() == "/start":
         record_usage(chat_id, "start")
         set_pending(chat_id_str, "await_license", None)
@@ -741,7 +699,7 @@ async def telegram_webhook(
         )
         return {"ok": True}
 
-    # /start TOKEN [email] (fallback)
+    # ========= /start TOKEN [email] =========
     if text.lower().startswith("/start "):
         record_usage(chat_id, "start_token")
         parts = text.split()
@@ -770,7 +728,7 @@ async def telegram_webhook(
 
         set_client_email(chat_id_str, email)
         await tg_send(chat_id, "✅ Obrigado! Configurando sua planilha de lançamentos...")
-
+        
         okf, errf, link = await setup_client_file(chat_id_str, email)
         if not okf:
             logger.error(f"ERRO CRÍTICO NO SETUP DO ARQUIVO: {errf}")
@@ -781,7 +739,7 @@ async def telegram_webhook(
         await tg_send(chat_id, "Agora pode me contar seus gastos. Ex.: _gastei 45,90 no mercado via cartão hoje_")
         return {"ok": True}
 
-    # Conversa pendente
+    # ========= Conversa pendente =========
     step, temp_license = get_pending(chat_id_str)
     if step == "await_license":
         token = text.strip()
@@ -806,7 +764,7 @@ async def telegram_webhook(
         set_client_email(chat_id_str, email)
         set_pending(chat_id_str, None, None)
         await tg_send(chat_id, "✅ Obrigado! Configurando sua planilha de lançamentos...")
-
+        
         okf, errf, link = await setup_client_file(chat_id_str, email)
         if not okf:
             logger.error(f"ERRO CRÍTICO NO SETUP DO ARQUIVO: {errf}")
@@ -817,13 +775,13 @@ async def telegram_webhook(
         await tg_send(chat_id, "Agora pode me contar seus gastos. Ex.: _gastei 45,90 no mercado via cartão hoje_")
         return {"ok": True}
 
-    # exige licença
+    # ===== exige licença =====
     ok, msg = require_active_license(chat_id_str)
     if not ok:
         await tg_send(chat_id, f"❗ {msg}")
         return {"ok": True}
 
-    # Lançamento
+    # ===== Lançamento =====
     row, err = parse_natural(text)
     if err:
         await tg_send(chat_id, f"❗ {err}")
