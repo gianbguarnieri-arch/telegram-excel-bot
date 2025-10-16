@@ -6,3 +6,4 @@ msal
 google-api-python-client
 google-auth
 google-auth-oauthlib
+psycopg2-binary
