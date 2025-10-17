@@ -1,6 +1,8 @@
+# -*- coding: utf-8 -*-
 import os
 import re
 import json
+import sqlite3
 import secrets
 import string
 import logging
@@ -11,275 +13,70 @@ import httpx
 from fastapi import FastAPI, Request, Header
 from fastapi.responses import HTMLResponse, RedirectResponse
 
-# Google APIs (inalterado)
-from google.oauth2 import service_account
+# Google APIs
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-# ====== PostgreSQL ======
+# Postgres (Neon)
 import psycopg2
 import psycopg2.extras
 
+# ---------------------------------------
+# LOG
+# ---------------------------------------
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("planilha-bot")
 
+# ---------------------------------------
+# FASTAPI
+# ---------------------------------------
 app = FastAPI()
 
-# =========================================================
-# ENVs (Telegram + Google)
-# =========================================================
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID")
+# ---------------------------------------
+# ENVs
+# ---------------------------------------
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID", "").strip()
 TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
 
-# >>> NOVO: Postgres (Neon)
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL não configurado. Defina essa variável no Render.")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
-# ====== Google: modos de autenticação ======
-GOOGLE_USE_OAUTH = os.getenv("GOOGLE_USE_OAUTH", "0") == "1"
-GOOGLE_OAUTH_CLIENT_ID     = os.getenv("GOOGLE_OAUTH_CLIENT_ID")
+SQLITE_PATH = os.getenv("SQLITE_PATH", "/tmp/db.sqlite")
+
+GOOGLE_USE_OAUTH = os.getenv("GOOGLE_USE_OAUTH", "1") == "1"
+GOOGLE_OAUTH_CLIENT_ID = os.getenv("GOOGLE_OAUTH_CLIENT_ID")
 GOOGLE_OAUTH_CLIENT_SECRET = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET")
-GOOGLE_OAUTH_REDIRECT_URI  = os.getenv("GOOGLE_OAUTH_REDIRECT_URI")
+GOOGLE_OAUTH_REDIRECT_URI = os.getenv("GOOGLE_OAUTH_REDIRECT_URI")
 GOOGLE_OAUTH_SCOPES = (os.getenv("GOOGLE_OAUTH_SCOPES") or
                        "https://www.googleapis.com/auth/drive https://www.googleapis.com/auth/spreadsheets").split()
-GOOGLE_TOKEN_PATH  = os.getenv("GOOGLE_TOKEN_PATH", "/tmp/google_oauth_token.json")
+GOOGLE_TOKEN_PATH = os.getenv("GOOGLE_TOKEN_PATH", "/tmp/google_oauth_token.json")
 OAUTH_STATE_SECRET = os.getenv("OAUTH_STATE_SECRET", "change-me")
 
-# (2) Service Account — fallback
-GOOGLE_SA_JSON = os.getenv("GOOGLE_SA_JSON")
-
-# ====== IDs do modelo e pasta de destino (Drive) ======
-GS_TEMPLATE_ID    = os.getenv("GS_TEMPLATE_ID")
+GS_TEMPLATE_ID = os.getenv("GS_TEMPLATE_ID")
 GS_DEST_FOLDER_ID = os.getenv("GS_DEST_FOLDER_ID")
 
-# Opções
-WORKSHEET_NAME   = os.getenv("WORKSHEET_NAME", "Plan1")  # você pode pôr "🧾" aqui
-SHARE_LINK_ROLE  = os.getenv("SHARE_LINK_ROLE", "writer")  # writer|commenter|reader
+WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "Registro")  # sua aba
+# Regras da sua planilha:
+# Queremos escrever a partir da linha 8 e **coluna B** (ou seja, range B:I)
+ROW_START = 8
+COL_START_LETTER = "B"  # B até I
 
+# SCOPES para lib de service account (fallback se você quiser)
 SCOPES_SA = [
     "https://www.googleapis.com/auth/drive",
     "https://www.googleapis.com/auth/spreadsheets",
 ]
 
-# =========================================================
-# DB helpers (PostgreSQL)
-# =========================================================
-def pg_conn():
-    # autocommit=True simplifica updates/insert sem precisar chamar commit em todo lugar
-    conn = psycopg2.connect(DATABASE_URL, sslmode="require")
-    conn.autocommit = True
-    return conn
 
-def licenses_db_init():
-    """Cria o schema necessário no Postgres (idempotente)."""
-    ddl = [
-        """
-        CREATE TABLE IF NOT EXISTS licenses (
-            license_key   TEXT PRIMARY KEY,
-            status        TEXT NOT NULL DEFAULT 'active',
-            max_files     INTEGER NOT NULL DEFAULT 1,
-            expires_at    TIMESTAMPTZ,
-            notes         TEXT
-        );
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS clients (
-            chat_id     TEXT PRIMARY KEY,
-            license_key TEXT REFERENCES licenses(license_key),
-            email       TEXT,
-            file_scope  TEXT,
-            item_id     TEXT,
-            created_at  TIMESTAMPTZ,
-            last_seen_at TIMESTAMPTZ
-        );
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS usage_log (
-            chat_id TEXT,
-            event   TEXT,
-            ts      TIMESTAMPTZ
-        );
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS pending (
-            chat_id      TEXT PRIMARY KEY,
-            step         TEXT,
-            temp_license TEXT,
-            created_at   TIMESTAMPTZ
-        );
-        """
-    ]
-    with pg_conn() as conn:
-        with conn.cursor() as cur:
-            for q in ddl:
-                cur.execute(q)
-    logger.info("✅ Postgres schema pronto.")
-
-def _now_iso():
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-def record_usage(chat_id, event):
-    with pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO usage_log(chat_id, event, ts) VALUES (%s,%s, %s)",
-                (str(chat_id), event, datetime.now(timezone.utc))
-            )
-
-def _gen_key(prefix="GF"):
-    alphabet = string.ascii_uppercase + string.digits
-    part = lambda n: "".join(secrets.choice(alphabet) for _ in range(n))
-    return f"{prefix}-{part(4)}-{part(4)}"
-
-def create_license(days: Optional[int] = 30, max_files: int = 1, notes: Optional[str] = None, custom_key: Optional[str] = None):
-    key = custom_key or _gen_key()
-    expires_at = (datetime.now(timezone.utc) + timedelta(days=days)) if days else None
-    with pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO licenses(license_key,status,max_files,expires_at,notes) VALUES(%s,%s,%s,%s,%s)",
-                (key, "active", max_files, expires_at, notes)
-            )
-    return key, expires_at.isoformat(timespec="seconds") if expires_at else None
-
-def get_license(license_key: str):
-    with pg_conn() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-            cur.execute(
-                "SELECT license_key,status,max_files,expires_at,notes FROM licenses WHERE license_key=%s",
-                (license_key,)
-            )
-            row = cur.fetchone()
-    if not row:
-        return None
-    return {
-        "license_key": row["license_key"],
-        "status": row["status"],
-        "max_files": row["max_files"],
-        "expires_at": row["expires_at"].isoformat(timespec="seconds") if row["expires_at"] else None,
-        "notes": row["notes"]
-    }
-
-def is_license_valid(lic: dict):
-    if not lic:
-        return False, "Licença não encontrada."
-    if lic["status"] != "active":
-        return False, "Licença não está ativa."
-    if lic["expires_at"]:
-        try:
-            if datetime.now(timezone.utc) > datetime.fromisoformat(lic["expires_at"]):
-                return False, "Licença expirada."
-        except Exception:
-            return False, "Validade da licença inválida."
-    return True, None
-
-def bind_license_to_chat(chat_id: str, license_key: str):
-    with pg_conn() as conn:
-        with conn.cursor() as cur:
-            # Verifica se essa licença já está vinculada a outro chat
-            cur.execute("SELECT chat_id FROM clients WHERE license_key=%s AND chat_id<>%s LIMIT 1",
-                        (license_key, str(chat_id)))
-            conflict = cur.fetchone()
-            if conflict:
-                return False, "Essa licença já foi usada por outro Telegram."
-            # upsert do cliente
-            cur.execute(
-                """
-                INSERT INTO clients(chat_id, created_at, last_seen_at)
-                VALUES (%s, %s, %s)
-                ON CONFLICT (chat_id) DO NOTHING
-                """,
-                (str(chat_id), datetime.now(timezone.utc), datetime.now(timezone.utc))
-            )
-            cur.execute(
-                "UPDATE clients SET license_key=%s, last_seen_at=%s WHERE chat_id=%s",
-                (license_key, datetime.now(timezone.utc), str(chat_id))
-            )
-    return True, None
-
-def get_client(chat_id: str):
-    with pg_conn() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-            cur.execute(
-                """SELECT chat_id, license_key, email, file_scope, item_id, created_at, last_seen_at
-                   FROM clients WHERE chat_id=%s""",
-                (str(chat_id),)
-            )
-            row = cur.fetchone()
-    if not row:
-        return None
-    return {
-        "chat_id": row["chat_id"],
-        "license_key": row["license_key"],
-        "email": row["email"],
-        "file_scope": row["file_scope"],
-        "item_id": row["item_id"],
-        "created_at": row["created_at"].isoformat(timespec="seconds") if row["created_at"] else None,
-        "last_seen_at": row["last_seen_at"].isoformat(timespec="seconds") if row["last_seen_at"] else None,
-    }
-
-def set_client_email(chat_id: str, email: str):
-    with pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE clients SET email=%s, last_seen_at=%s WHERE chat_id=%s",
-                (email, datetime.now(timezone.utc), str(chat_id))
-            )
-
-def set_client_file(chat_id: str, item_id: str):
-    with pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE clients SET file_scope=%s, item_id=%s, last_seen_at=%s WHERE chat_id=%s",
-                ("google", item_id, datetime.now(timezone.utc), str(chat_id))
-            )
-
-def set_pending(chat_id: str, step: Optional[str], temp_license: Optional[str]):
-    with pg_conn() as conn:
-        with conn.cursor() as cur:
-            if step:
-                cur.execute(
-                    """
-                    INSERT INTO pending(chat_id, step, temp_license, created_at)
-                    VALUES(%s,%s,%s,%s)
-                    ON CONFLICT (chat_id) DO UPDATE SET
-                        step=EXCLUDED.step,
-                        temp_license=EXCLUDED.temp_license,
-                        created_at=EXCLUDED.created_at
-                    """,
-                    (str(chat_id), step, temp_license, datetime.now(timezone.utc))
-                )
-            else:
-                cur.execute("DELETE FROM pending WHERE chat_id=%s", (str(chat_id),))
-
-def get_pending(chat_id: str):
-    with pg_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT step, temp_license FROM pending WHERE chat_id=%s", (str(chat_id),))
-            row = cur.fetchone()
-    if not row:
-        return None, None
-    return row[0], row[1]
-
-def require_active_license(chat_id: str):
-    cli = get_client(chat_id)
-    if not cli:
-        return False, "Para usar o bot você precisa **ativar sua licença**. Envie /start e siga as instruções."
-    lic = get_license(cli["license_key"]) if cli["license_key"] else None
-    ok, err = is_license_valid(lic)
-    if not ok:
-        return False, f"Licença inválida: {err}\nFale com o suporte para renovar/ativar."
-    return True, None
-
-
-# =========================================================
-# Telegram helper
-# =========================================================
+# ---------------------------------------
+# TELEGRAM
+# ---------------------------------------
 async def tg_send(chat_id, text):
+    if not TELEGRAM_TOKEN:
+        logger.error("TELEGRAM_TOKEN ausente")
+        return
     async with httpx.AsyncClient(timeout=12) as client:
         try:
             resp = await client.post(
@@ -292,9 +89,226 @@ async def tg_send(chat_id, text):
         except httpx.RequestError as e:
             logger.error(f"Falha ao enviar msg ao Telegram (Request): {e}")
 
-# =========================================================
-# Google helpers — Auth (inalterado)
-# =========================================================
+
+# ---------------------------------------
+# SQLITE (mantemos uso leve para estados/pendências)
+# ---------------------------------------
+def _db():
+    return sqlite3.connect(SQLITE_PATH)
+
+
+def _now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def local_db_init():
+    con = _db()
+    cur = con.cursor()
+    # apenas dados transitórios do bot
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS clients (
+        chat_id TEXT PRIMARY KEY,
+        license_key TEXT,
+        email TEXT,
+        file_scope TEXT,
+        item_id TEXT,
+        created_at TEXT,
+        last_seen_at TEXT
+    );
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS usage (
+        chat_id TEXT,
+        event TEXT,
+        ts TEXT
+    );
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS pending (
+        chat_id TEXT PRIMARY KEY,
+        step TEXT,
+        temp_license TEXT,
+        created_at TEXT
+    );
+    """)
+    con.commit()
+    con.close()
+
+
+def record_usage(chat_id, event):
+    con = _db()
+    con.execute("INSERT INTO usage(chat_id, event, ts) VALUES(?,?,?)",
+                (str(chat_id), event, _now_iso()))
+    con.commit()
+    con.close()
+
+
+def set_pending(chat_id: str, step: Optional[str], temp_license: Optional[str]):
+    con = _db()
+    if step:
+        con.execute("""
+        INSERT INTO pending(chat_id, step, temp_license, created_at)
+        VALUES(?,?,?,?)
+        ON CONFLICT(chat_id) DO UPDATE SET step=excluded.step,
+                                          temp_license=excluded.temp_license,
+                                          created_at=excluded.created_at
+        """, (str(chat_id), step, temp_license, _now_iso()))
+    else:
+        con.execute("DELETE FROM pending WHERE chat_id=?", (str(chat_id),))
+    con.commit()
+    con.close()
+
+
+def get_pending(chat_id: str):
+    con = _db()
+    cur = con.execute("SELECT step, temp_license FROM pending WHERE chat_id=?", (str(chat_id),))
+    row = cur.fetchone()
+    con.close()
+    return (row[0], row[1]) if row else (None, None)
+
+
+def set_client_email(chat_id: str, email: str):
+    con = _db()
+    con.execute("INSERT INTO clients(chat_id, created_at) VALUES(?,?) ON CONFLICT(chat_id) DO NOTHING",
+                (str(chat_id), _now_iso()))
+    con.execute("UPDATE clients SET email=?, last_seen_at=? WHERE chat_id=?",
+                (email, _now_iso(), str(chat_id)))
+    con.commit()
+    con.close()
+
+
+def get_client(chat_id: str):
+    con = _db()
+    cur = con.execute("""SELECT chat_id, license_key, email, file_scope, item_id, created_at, last_seen_at
+                         FROM clients WHERE chat_id=?""", (str(chat_id),))
+    row = cur.fetchone()
+    con.close()
+    if not row:
+        return None
+    return {
+        "chat_id": row[0],
+        "license_key": row[1],
+        "email": row[2],
+        "file_scope": row[3],
+        "item_id": row[4],
+        "created_at": row[5],
+        "last_seen_at": row[6],
+    }
+
+
+def set_client_file(chat_id: str, item_id: str):
+    con = _db()
+    con.execute("INSERT INTO clients(chat_id, created_at) VALUES(?,?) ON CONFLICT(chat_id) DO NOTHING",
+                (str(chat_id), _now_iso()))
+    con.execute("""UPDATE clients SET file_scope=?, item_id=?, last_seen_at=?
+                   WHERE chat_id=?""",
+                ("google", item_id, _now_iso(), str(chat_id)))
+    con.commit()
+    con.close()
+
+
+def set_client_license(chat_id: str, license_key: str):
+    con = _db()
+    con.execute("INSERT INTO clients(chat_id, created_at) VALUES(?,?) ON CONFLICT(chat_id) DO NOTHING",
+                (str(chat_id), _now_iso()))
+    con.execute("UPDATE clients SET license_key=?, last_seen_at=? WHERE chat_id=?",
+                (license_key, _now_iso(), str(chat_id)))
+    con.commit()
+    con.close()
+
+
+# ---------------------------------------
+# POSTGRES (Neon) - Licenças
+# ---------------------------------------
+def pg_conn():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL ausente (Neon)")
+    return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+
+
+def pg_init():
+    """Cria tabela de licenças se não existir (colunas de acordo com o que você montou no Neon)."""
+    with pg_conn() as con, con.cursor() as cur:
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS licenses(
+            id SERIAL PRIMARY KEY,
+            chave_de_licença TEXT UNIQUE NOT NULL,
+            email TEXT,
+            data_de_início TIMESTAMP,
+            data_final TIMESTAMP,
+            dias_de_validade INTEGER NOT NULL DEFAULT 30,
+            status TEXT NOT NULL DEFAULT 'ativo',
+            notas TEXT
+        );
+        """)
+        con.commit()
+
+
+def pg_get_license(license_key: str) -> Optional[dict]:
+    with pg_conn() as con, con.cursor() as cur:
+        cur.execute("SELECT * FROM licenses WHERE chave_de_licença=%s LIMIT 1", (license_key,))
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+
+def pg_update_license_email_and_dates(license_key: str, email: str):
+    """Se a licença ainda não tem data de início/final, marca agora.
+       Sempre atualiza e-mail (último e-mail válido do cliente)."""
+    now = datetime.now(timezone.utc)
+    with pg_conn() as con, con.cursor() as cur:
+        # pega linha atual
+        cur.execute("SELECT * FROM licenses WHERE chave_de_licença=%s LIMIT 1", (license_key,))
+        row = cur.fetchone()
+        if not row:
+            return
+
+        start = row["data_de_início"]
+        end = row["data_final"]
+        days = row.get("dias_de_validade", 30) or 30
+
+        if not start:
+            start = now
+            end = now + timedelta(days=days)
+
+        cur.execute("""
+            UPDATE licenses
+               SET email=%s,
+                   data_de_início=%s,
+                   data_final=%s
+             WHERE chave_de_licença=%s
+        """, (email, start, end, license_key))
+        con.commit()
+
+
+def pg_set_status(license_key: str, new_status: str):
+    with pg_conn() as con, con.cursor() as cur:
+        cur.execute("UPDATE licenses SET status=%s WHERE chave_de_licença=%s", (new_status, license_key))
+        con.commit()
+
+
+def check_license_allowed(license_key: str) -> Tuple[bool, str]:
+    """Valida na tabela do Neon: status, expiração."""
+    lic = pg_get_license(license_key)
+    if not lic:
+        return False, "Licença não encontrada."
+
+    status = (lic.get("status") or "").lower().strip()
+    if status != "ativo":
+        return False, "Licença desativada."
+
+    end = lic.get("data_final")
+    if end:
+        now = datetime.now(timezone.utc)
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+        if now > end:
+            return False, f"Licença expirada em {end.strftime('%Y-%m-%d %H:%M')}."
+    return True, ""
+
+
+# ---------------------------------------
+# GOOGLE AUTH & SERVICES
+# ---------------------------------------
 def _client_config_dict():
     return {
         "web": {
@@ -305,6 +319,7 @@ def _client_config_dict():
             "token_uri": "https://oauth2.googleapis.com/token",
         }
     }
+
 
 def _save_credentials(creds: Credentials):
     data = {
@@ -318,6 +333,7 @@ def _save_credentials(creds: Credentials):
     with open(GOOGLE_TOKEN_PATH, "w") as f:
         json.dump(data, f)
 
+
 def _load_credentials() -> Optional[Credentials]:
     if not os.path.exists(GOOGLE_TOKEN_PATH):
         return None
@@ -325,7 +341,9 @@ def _load_credentials() -> Optional[Credentials]:
         data = json.load(f)
     return Credentials.from_authorized_user_info(data, GOOGLE_OAUTH_SCOPES)
 
-def _oauth_services():
+
+def google_services():
+    """Only OAuth (sua conta) — recomendado."""
     from google.auth.transport.requests import Request
     creds = _load_credentials()
     if not creds or not creds.valid:
@@ -333,48 +351,15 @@ def _oauth_services():
             creds.refresh(Request())
             _save_credentials(creds)
         else:
-            logger.error("Autorização OAuth ausente ou inválida. Visite /oauth/start")
             raise RuntimeError("Autorize primeiro em /oauth/start")
     drive = build("drive", "v3", credentials=creds)
     sheets = build("sheets", "v4", credentials=creds)
     return drive, sheets
 
-def _load_sa_json_tolerant(raw: str) -> dict:
-    if not raw:
-        raise RuntimeError("GOOGLE_SA_JSON não configurado.")
-    s = raw.strip()
-    if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
-        s = s[1:-1]
-    try:
-        return json.loads(s)
-    except Exception:
-        try:
-            s2 = bytes(s, "utf-8").decode("unicode_escape")
-            return json.loads(s2)
-        except Exception as e2:
-            logger.error(f"Falha ao ler GOOGLE_SA_JSON: {e2}")
-            raise RuntimeError(f"Falha ao ler GOOGLE_SA_JSON: {e2}")
 
-def _sa_services():
-    info = _load_sa_json_tolerant(GOOGLE_SA_JSON)
-    creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES_SA)
-    drive = build("drive", "v3", credentials=creds)
-    sheets = build("sheets", "v4", credentials=creds)
-    return drive, sheets
-
-def google_services():
-    return _oauth_services() if GOOGLE_USE_OAUTH else _sa_services()
-
-# =========================================================
-# Google helpers — Drive/Sheets (inalterado)
-# =========================================================
-def drive_find_in_folder(service, folder_id: str, name: str) -> Optional[str]:
-    safe_name = name.replace("'", "\\'")
-    q = f"name = '{safe_name}' and '{folder_id}' in parents and trashed = false"
-    res = service.files().list(q=q, spaces="drive", fields="files(id,name)", pageSize=1).execute()
-    files = res.get("files", [])
-    return files[0]["id"] if files else None
-
+# ---------------------------------------
+# GOOGLE DRIVE
+# ---------------------------------------
 def drive_copy_template(new_name: str) -> str:
     if not GS_TEMPLATE_ID or not GS_DEST_FOLDER_ID:
         raise RuntimeError("GS_TEMPLATE_ID e GS_DEST_FOLDER_ID devem estar configurados.")
@@ -387,6 +372,7 @@ def drive_copy_template(new_name: str) -> str:
     file = drive.files().copy(fileId=GS_TEMPLATE_ID, body=body, fields="id").execute()
     return file["id"]
 
+
 def drive_share_with_email(file_id: str, email: str, role: str = "writer") -> str:
     drive, _ = google_services()
     try:
@@ -396,34 +382,57 @@ def drive_share_with_email(file_id: str, email: str, role: str = "writer") -> st
             fields="id"
         ).execute()
     except HttpError as e:
-        if 'already has permission' not in str(e) and 'Domain policy' not in str(e):
+        s = str(e)
+        if "already has permission" not in s and "Domain policy" not in s:
             logger.error(f"Erro ao compartilhar {file_id} com {email}: {e}")
             raise
     meta = drive.files().get(fileId=file_id, fields="webViewLink").execute()
     return meta.get("webViewLink")
 
-def drive_copy_and_link(email: str) -> Tuple[str, str]:
-    new_name = f"Lancamentos - {email}"
-    file_id = drive_copy_template(new_name)
-    link = drive_share_with_email(file_id, email, SHARE_LINK_ROLE)
-    return file_id, link
 
-def sheets_append_row(spreadsheet_id: str, sheet_name: str, values: List):
+def drive_find_in_folder(service, folder_id: str, name: str) -> Optional[str]:
+    safe_name = name.replace("'", "\\'")
+    q = f"name = '{safe_name}' and '{folder_id}' in parents and trashed = false"
+    res = service.files().list(q=q, spaces="drive", fields="files(id,name)", pageSize=1).execute()
+    files = res.get("files", [])
+    return files[0]["id"] if files else None
+
+
+# ---------------------------------------
+# GOOGLE SHEETS  (escrever a partir da B8 sem inserir linhas)
+# ---------------------------------------
+def sheets_find_first_empty_row_from(sheets, spreadsheet_id: str, sheet_name: str, start_row: int) -> int:
+    # Lê a coluna B (onde há a "Data") a partir da linha 8
+    rng = f"{sheet_name}!B{start_row}:B"
+    res = sheets.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id, range=rng, majorDimension="ROWS"
+    ).execute()
+    values = res.get("values", [])
+    # A primeira linha vazia é start_row + len(valores_não_vazios)
+    for idx, row in enumerate(values, 0):
+        if not row or not (row[0] or "").strip():
+            return start_row + idx
+    return start_row + len(values)
+
+
+def sheets_write_row(spreadsheet_id: str, sheet_name: str, values: List):
+    """Escreve na primeira linha vazia começando em B8 (B..I).
+       Colunas: Data, Tipo, Grupo, Categoria, Descrição, Valor, Forma, Condição"""
     _, sheets = google_services()
+    first_row = sheets_find_first_empty_row_from(sheets, spreadsheet_id, sheet_name, ROW_START)
+    rng = f"{sheet_name}!B{first_row}:I{first_row}"
     body = {"values": [values]}
-    # Mantém o append (Sheets decide a próxima linha dentro do range da planilha)
-    rng = f"{sheet_name}!A:H"  # ajuste aqui se sua planilha começar em outra coluna/aba
-    sheets.spreadsheets().values().append(
+    sheets.spreadsheets().values().update(
         spreadsheetId=spreadsheet_id,
         range=rng,
         valueInputOption="USER_ENTERED",
-        insertDataOption="INSERT_ROWS",
         body=body
     ).execute()
 
-# =========================================================
-# NLP e Parsers (igual ao que você já usava)
-# =========================================================
+
+# ---------------------------------------
+# NLP / Parsing (melhorias)
+# ---------------------------------------
 def parse_money(text: str) -> Optional[float]:
     m = re.search(r"(\d{1,3}(?:\.\d{3})*(?:,\d{2})|\d+(?:\.\d{2})?)", text)
     if not m:
@@ -433,6 +442,7 @@ def parse_money(text: str) -> Optional[float]:
         return float(val)
     except:
         return None
+
 
 def parse_date(text: str) -> Optional[str]:
     t = text.lower()
@@ -451,15 +461,49 @@ def parse_date(text: str) -> Optional[str]:
             return None
     return None
 
+
+# Grupos com ícones conforme seu pedido
+GROUPS = {
+    "🏠Gastos Fixos": ["aluguel", "condomínio", "agua", "água", "energia", "internet", "plano de saúde", "escola"],
+    "📺Assinatura": ["netflix", "amazon", "disney", "spotify", "premiere", "globoplay", "apple tv"],
+    "💸Gastos Variáveis": ["mercado", "supermercado", "farmácia", "combustível", "passeio", "ifood", "viagem", "restaurante", "lanche", "pizza", "hamburg", "sushi"],
+    "🧾Despesas Temporárias": ["iptu", "ipva", "financiamento", "empréstimo"],
+    "💳Pagamento de Fatura": ["fatura", "cartão", "fatura do cartão"],
+    "💵Ganhos": ["salário", "vale", "renda extra", "pro labore", "pró labore"],
+    "💰Investimento": ["renda fixa", "renda variável", "fundos imobiliários", "tesouro"],
+    "📝Reserva": ["trocar de carro", "viagem pra disney", "reserva"],
+    "💲Saque/Resgate": ["saquei", "saque", "resgatei", "resgate"],
+}
+
+def normalize_spaces(s: str) -> str:
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def detect_group_and_category(text: str) -> Tuple[str, str]:
+    t = text.lower()
+    for group, kws in GROUPS.items():
+        for kw in kws:
+            if kw in t:
+                if group == "💳Pagamento de Fatura":
+                    # Categoria vira o nome do cartão
+                    m = re.search(r"cart[aã]o\s+([a-z0-9 ]+)", t)
+                    cat = f"Cartão {normalize_spaces(m.group(1))}" if m else "Cartão"
+                    return group, cat.title()
+                return group, kw.title()
+    # Default
+    return "💸Gastos Variáveis", "Outros"
+
+
 def detect_payment(text: str) -> str:
     t = text.lower()
-    m = re.search(r"cart[aã]o\s+([a-z0-9 ]+)", t)
+    # Não capturar "hoje" como parte do cartão
+    m = re.search(r"cart[aã]o\s+([a-z0-9 ]+?)(?:\s+hoje\b|\s|$)", t)
     if m:
-        brand = m.group(1).strip()
-        brand = re.sub(r"\s+", " ", brand).strip()
-        # remove "hoje"/"ontem" acidental no nome do cartão
-        brand = re.sub(r"\b(hoje|ontem)\b", "", brand).strip()
+        brand = normalize_spaces(m.group(1).replace("hoje", ""))
+        brand = re.sub(r"\bhoje\b", "", brand, flags=re.I)
+        brand = normalize_spaces(brand)
         return f"💳 cartão {brand}" if brand else "💳 cartão"
+
     if "pix" in t:
         return "Pix"
     if "dinheiro" in t or "cash" in t:
@@ -469,6 +513,7 @@ def detect_payment(text: str) -> str:
     if "crédito" in t or "credito" in t:
         return "💳 cartão"
     return "Outros"
+
 
 def detect_installments(text: str) -> str:
     t = text.lower()
@@ -481,94 +526,67 @@ def detect_installments(text: str) -> str:
         return "à vista"
     return "à vista"
 
-CATEGORIES = {
-    "Restaurante": ["restaurante", "almoço", "jantar", "lanche", "pizza", "hamburg", "sushi"],
-    "Mercado": ["mercado", "supermercado", "compras de mercado", "rancho", "hortifruti"],
-    "Farmácia": ["farmácia", "remédio", "medicamento", "drogaria"],
-    "Combustível": ["gasolina", "álcool", "etanol", "diesel", "posto", "combustível"],
-    "Ifood": ["ifood", "i-food"],
-    "Passeio em família": ["passeio", "parque", "cinema", "lazer"],
-    "Viagem": ["hotel", "passagem", "viagem", "airbnb"],
-    "Assinatura": ["netflix", "amazon", "disney", "spotify", "premiere"],
-    "Aluguel": ["aluguel", "condomínio"],
-    "Água": ["água", "sabesp"],
-    "Energia": ["energia", "luz"],
-    "Internet": ["internet", "banda larga", "fibra"],
-    "Plano de Saúde": ["plano de saúde", "unimed", "amil"],
-    "Escola": ["escola", "mensalidade", "faculdade", "curso"],
-    "Imposto": ["iptu", "ipva"],
-    "Financiamento": ["financiamento", "parcela do carro", "parcela da casa"],
-}
-
-def map_group(category: str) -> str:
-    if category in ["Aluguel", "Água", "Energia", "Internet", "Plano de Saúde", "Escola", "Assinatura"]:
-        return "Gastos Fixos"
-    if category in ["Imposto", "Financiamento", "Empréstimo"]:
-        return "Despesas Temporárias"
-    if category in ["Mercado", "Farmácia", "Combustível", "Passeio em família", "Ifood", "Viagem", "Restaurante"]:
-        return "Gastos Variáveis"
-    if category in ["Salário", "Vale", "Renda Extra 1", "Renda Extra 2", "Pró labore"]:
-        return "Ganhos"
-    if category in ["Renda Fixa", "Renda Variável", "Fundos imobiliários"]:
-        return "Investimento"
-    if category in ["Trocar de carro", "Viagem pra Disney"]:
-        return "Reserva"
-    return "Gastos Variáveis"
-
-def detect_category_and_desc(text: str):
-    t = text.lower()
-    for cat, kws in CATEGORIES.items():
-        for kw in kws:
-            if kw in t:
-                m = re.search(r"(comprei|paguei|gastei)\s+(.*?)(?:\s+na\s+|\s+no\s+|\s+via\s+|$)", t)
-                desc = None
-                if m:
-                    raw = m.group(2)
-                    raw = re.sub(r"\d{1,3}(?:\.\d{3})*(?:,\d{2})|\d+(?:\.\d{2})?", "", raw)
-                    raw = re.sub(r"\b(hoje|ontem|\d{1,2}/\d{1,2}(?:/\d{4})?)\b", "", raw)
-                    raw = raw.strip(" .,-")
-                    if raw and len(raw) < 60:
-                        desc = raw
-                return cat, (desc if desc else None)
-    return "Outros", None
 
 def parse_natural(text: str) -> Tuple[Optional[List], Optional[str]]:
     valor = parse_money(text)
     if valor is None:
         return None, "Não achei o valor. Ex.: 45,90"
+
     data_iso = parse_date(text) or datetime.now().strftime("%Y-%m-%d")
+    group, category = detect_group_and_category(text)
     forma = detect_payment(text)
     cond = detect_installments(text)
-    cat, desc = detect_category_and_desc(text)
-    tipo = "▲ Entrada" if re.search(r"\b(ganhei|recebi|sal[aá]rio|renda)\b", text.lower()) else "▼ Saída"
-    grupo = map_group(cat)
-    return [data_iso, tipo, grupo, cat, (desc or ""), float(valor), forma, cond], None
 
-# =========================================================
-# Provisionamento por cliente
-# =========================================================
-def _ensure_unique_or_reuse(email: str) -> Optional[str]:
+    # ▲ Entrada / ▼ Saída
+    tipo = "▲ Entrada" if re.search(r"\b(ganhei|recebi|sal[aá]rio|renda)\b", text.lower()) else "▼ Saída"
+
+    # Descrição: tente extrair qualquer coisa útil sem data/valor
+    desc = ""
+    m = re.search(r"(comprei|paguei|gastei)\s+(.*?)(?:\s+na\s+|\s+no\s+|\s+via\s+|$)", text.lower())
+    if m:
+        raw = m.group(2)
+        raw = re.sub(r"\d{1,3}(?:\.\d{3})*(?:,\d{2})|\d+(?:\.\d{2})?", "", raw)  # remove valores
+        raw = re.sub(r"\b(hoje|ontem|\d{1,2}/\d{1,2}(?:/\d{4})?)\b", "", raw)  # remove datas
+        desc = normalize_spaces(raw)[:60]
+
+    # ordem (B..I): Data, Tipo, Grupo, Categoria, Descrição, Valor, Forma, Condição
+    row = [data_iso, tipo, group, category, desc, float(valor), forma, cond]
+    return row, None
+
+
+# ---------------------------------------
+# PROVISIONAMENTO / CLIENT
+# ---------------------------------------
+def ensure_unique_or_reuse(email: str) -> Optional[str]:
     if not GS_DEST_FOLDER_ID:
         return None
     drive, _ = google_services()
     name = f"Lancamentos - {email}"
     return drive_find_in_folder(drive, GS_DEST_FOLDER_ID, name)
 
+
+def drive_copy_and_link(email: str) -> Tuple[str, str]:
+    new_name = f"Lancamentos - {email}"
+    file_id = drive_copy_template(new_name)
+    link = drive_share_with_email(file_id, email, role="writer")
+    return file_id, link
+
+
 async def setup_client_file(chat_id: str, email: str) -> Tuple[bool, Optional[str], Optional[str]]:
     cli = get_client(chat_id)
     if cli and cli.get("item_id"):
         try:
-            link = drive_share_with_email(cli["item_id"], email, SHARE_LINK_ROLE)
+            link = drive_share_with_email(cli["item_id"], email, role="writer")
         except Exception:
             link = None
         return True, None, link
 
     try:
-        exist_id = _ensure_unique_or_reuse(email)
-        if exist_id:
-            set_client_file(str(chat_id), exist_id)
+        exist = ensure_unique_or_reuse(email)
+        if exist:
+            set_client_file(str(chat_id), exist)
             try:
-                link = drive_share_with_email(exist_id, email, SHARE_LINK_ROLE)
+                link = drive_share_with_email(exist, email, role="writer")
             except Exception:
                 link = None
             return True, None, link
@@ -576,13 +594,13 @@ async def setup_client_file(chat_id: str, email: str) -> Tuple[bool, Optional[st
         new_id, web_link = drive_copy_and_link(email)
         set_client_file(str(chat_id), new_id)
         return True, None, web_link
-
     except HttpError as e:
-        logger.error(f"HttpError na API Google: {e}")
+        logger.error(f"HttpError Google: {e}")
         return False, f"Falha Google API: {e}", None
     except Exception as e:
-        logger.error(f"Exceção ao criar planilha: {e}")
+        logger.error(f"setup_client_file exception: {e}")
         return False, f"Falha ao criar planilha: {e}", None
+
 
 def add_row_to_client(values: List, chat_id: str):
     if len(values) != 8:
@@ -590,45 +608,68 @@ def add_row_to_client(values: List, chat_id: str):
     cli = get_client(chat_id)
     if not cli or not cli.get("item_id"):
         raise RuntimeError("Planilha do cliente não configurada.")
-    sheets_append_row(cli["item_id"], WORKSHEET_NAME, values)
+    sheets_write_row(cli["item_id"], WORKSHEET_NAME, values)
 
-# =========================================================
-# Rotas
-# =========================================================
+
+# ---------------------------------------
+# LICENÇA (Regra de acesso)
+# ---------------------------------------
+def require_active_license(chat_id: str) -> Tuple[bool, str]:
+    cli = get_client(chat_id)
+    if not cli or not cli.get("license_key"):
+        return False, "Para usar o bot você precisa **ativar sua licença**. Envie /start e siga as instruções."
+    ok, err = check_license_allowed(cli["license_key"])
+    if not ok:
+        return False, f"Licença inválida: {err}\nFale com o suporte para renovar/ativar."
+    return True, ""
+
+
+# ---------------------------------------
+# ROUTES
+# ---------------------------------------
 @app.on_event("startup")
 def _startup():
-    licenses_db_init()
-    logger.info("✅ DB inicializado (Postgres).")
-    print(f"Auth mode: {'OAuth' if GOOGLE_USE_OAUTH else 'Service Account'}")
+    local_db_init()
+    pg_init()
+    logger.info("✅ Startup ok")
+    logger.info(f"Auth mode: {'OAuth' if GOOGLE_USE_OAUTH else 'Service Account'}")
+
 
 @app.get("/")
 def root():
     return {"status": "ok", "auth_mode": "oauth" if GOOGLE_USE_OAUTH else "sa"}
 
+
 @app.get("/ping")
 def ping():
     return {"pong": True}
 
-# ===== Fluxo OAuth =====
+
+# ---------- OAuth ----------
 @app.get("/oauth/start")
 def oauth_start():
     if not GOOGLE_USE_OAUTH:
         return HTMLResponse("<h3>OAuth desabilitado. Defina GOOGLE_USE_OAUTH=1.</h3>", status_code=400)
     if not (GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET and GOOGLE_OAUTH_REDIRECT_URI):
         return HTMLResponse("<h3>Faltam variáveis do OAuth no ambiente.</h3>", status_code=500)
-    flow = Flow.from_client_config(_client_config_dict(), scopes=GOOGLE_OAUTH_SCOPES, redirect_uri=GOOGLE_OAUTH_REDIRECT_URI)
-    auth_url, state = flow.authorization_url(access_type="offline", include_granted_scopes="true", prompt="consent", state=OAUTH_STATE_SECRET)
+    flow = Flow.from_client_config(_client_config_dict(), scopes=GOOGLE_OAUTH_SCOPES,
+                                   redirect_uri=GOOGLE_OAUTH_REDIRECT_URI)
+    auth_url, state = flow.authorization_url(access_type="offline", include_granted_scopes="true",
+                                             prompt="consent", state=OAUTH_STATE_SECRET)
     return RedirectResponse(auth_url)
 
+
 @app.get("/oauth/callback")
-def oauth_callback(code: Optional[str] = None, state: Optional[str] = None):
+@app.get("/oauth2callback")
+def oauth_callback(code: str | None = None, state: str | None = None):
     if not GOOGLE_USE_OAUTH:
         return HTMLResponse("<h3>OAuth desabilitado. Defina GOOGLE_USE_OAUTH=1.</h3>", status_code=400)
     if state != OAUTH_STATE_SECRET:
         return HTMLResponse("<h3>State inválido.</h3>", status_code=400)
     if not code:
         return HTMLResponse("<h3>Faltou 'code'.</h3>", status_code=400)
-    flow = Flow.from_client_config(_client_config_dict(), scopes=GOOGLE_OAUTH_SCOPES, redirect_uri=GOOGLE_OAUTH_REDIRECT_URI)
+    flow = Flow.from_client_config(_client_config_dict(), scopes=GOOGLE_OAUTH_SCOPES,
+                                   redirect_uri=GOOGLE_OAUTH_REDIRECT_URI)
     flow.fetch_token(code=code)
     creds = flow.credentials
     if not creds.refresh_token:
@@ -636,7 +677,8 @@ def oauth_callback(code: Optional[str] = None, state: Optional[str] = None):
     _save_credentials(creds)
     return HTMLResponse("<h3>✅ OAuth ok! Pode voltar ao Telegram.</h3>")
 
-# ===== Telegram Bot Webhook =====
+
+# ---------- Telegram webhook ----------
 @app.post("/telegram/webhook")
 async def telegram_webhook(
     req: Request,
@@ -654,42 +696,34 @@ async def telegram_webhook(
         return {"ok": True}
     chat_id_str = str(chat_id)
 
-    # ===== Admin =====
+    # ADMIN
     if ADMIN_TELEGRAM_ID and chat_id_str == ADMIN_TELEGRAM_ID:
-        low = text.lower()
-
-        if low.startswith("/licenca nova"):
-            parts = text.split()
-            custom_key = None
-            days = 30
-            try:
-                if len(parts) >= 4 and parts[2] and parts[3].isdigit():
-                    custom_key = parts[2].strip()
-                    days = int(parts[3])
-                elif len(parts) >= 3 and parts[2].isdigit():
-                    days = int(parts[2])
-            except Exception:
-                pass
-            key, exp = create_license(days=None if days == 0 else days, custom_key=custom_key)
-            msg = f"🔑 *Licença criada:*\n`{key}`\n*Validade:* {'vitalícia' if not exp else exp}"
-            await tg_send(chat_id, msg)
+        if text.lower().startswith("/licenca desativar"):
+            parts = text.split(maxsplit=2)
+            if len(parts) >= 3:
+                key = parts[2].strip()
+                pg_set_status(key, "inativo")
+                await tg_send(chat_id, f"🔒 Licença `{key}` desativada.")
+            else:
+                await tg_send(chat_id, "Use: /licenca desativar GF-XXXX-XXXX")
+            return {"ok": True}
+        if text.lower().startswith("/licenca ativar"):
+            parts = text.split(maxsplit=2)
+            if len(parts) >= 3:
+                key = parts[2].strip()
+                pg_set_status(key, "ativo")
+                await tg_send(chat_id, f"✅ Licença `{key}` ativada.")
+            else:
+                await tg_send(chat_id, "Use: /licenca ativar GF-XXXX-XXXX")
             return {"ok": True}
 
-        if low.startswith("/licenca info"):
-            await tg_send(chat_id, f"Seu ADMIN ID ({chat_id_str}) está correto. O bot está ativo.")
-            return {"ok": True}
-
-        if low.startswith("/licenca"):
-            await tg_send(chat_id, "Comando de licença não reconhecido ou incompleto.")
-            return {"ok": True}
-
-    # ========= /cancel =========
+    # /cancel
     if text.lower() == "/cancel":
         set_pending(chat_id_str, None, None)
         await tg_send(chat_id, "Operação cancelada. Envie /start para começar novamente.")
         return {"ok": True}
 
-    # ========= /start =========
+    # /start (novo fluxo)
     if text.lower() == "/start":
         record_usage(chat_id, "start")
         set_pending(chat_id_str, "await_license", None)
@@ -699,7 +733,7 @@ async def telegram_webhook(
         )
         return {"ok": True}
 
-    # ========= /start TOKEN [email] =========
+    # /start TOKEN [email] (atalho)
     if text.lower().startswith("/start "):
         record_usage(chat_id, "start_token")
         parts = text.split()
@@ -710,16 +744,12 @@ async def telegram_webhook(
             await tg_send(chat_id, "Envie `/start SEU-CÓDIGO` (ex.: `/start GF-ABCD-1234`).")
             return {"ok": True}
 
-        lic = get_license(token)
-        ok, err = is_license_valid(lic)
+        ok, err = check_license_allowed(token)
         if not ok:
             await tg_send(chat_id, f"❌ Licença inválida: {err}")
             return {"ok": True}
 
-        ok2, err2 = bind_license_to_chat(chat_id_str, token)
-        if not ok2:
-            await tg_send(chat_id, f"❌ {err2}")
-            return {"ok": True}
+        set_client_license(chat_id_str, token)
 
         if not email:
             set_pending(chat_id_str, "await_email", token)
@@ -727,31 +757,27 @@ async def telegram_webhook(
             return {"ok": True}
 
         set_client_email(chat_id_str, email)
+        pg_update_license_email_and_dates(token, email)
+
         await tg_send(chat_id, "✅ Obrigado! Configurando sua planilha de lançamentos...")
-        
         okf, errf, link = await setup_client_file(chat_id_str, email)
         if not okf:
             logger.error(f"ERRO CRÍTICO NO SETUP DO ARQUIVO: {errf}")
-            await tg_send(chat_id, f"❌ Falha na configuração: {errf}. Verifique os logs do servidor.")
+            await tg_send(chat_id, f"❌ Falha na configuração: {errf}.")
             return {"ok": True}
-
         await tg_send(chat_id, f"🚀 Planilha configurada com sucesso!\n🔗 {link}")
         await tg_send(chat_id, "Agora pode me contar seus gastos. Ex.: _gastei 45,90 no mercado via cartão hoje_")
         return {"ok": True}
 
-    # ========= Conversa pendente =========
+    # Conversa pendente
     step, temp_license = get_pending(chat_id_str)
     if step == "await_license":
         token = text.strip()
-        lic = get_license(token)
-        ok, err = is_license_valid(lic)
+        ok, err = check_license_allowed(token)
         if not ok:
             await tg_send(chat_id, f"❌ Licença inválida: {err}\nTente novamente ou digite /cancel.")
             return {"ok": True}
-        ok2, err2 = bind_license_to_chat(chat_id_str, token)
-        if not ok2:
-            await tg_send(chat_id, f"❌ {err2}\nTente novamente ou digite /cancel.")
-            return {"ok": True}
+        set_client_license(chat_id_str, token)
         set_pending(chat_id_str, "await_email", token)
         await tg_send(chat_id, "Licença ok ✅\nAgora me diga seu *e-mail* (ex.: `cliente@gmail.com`).")
         return {"ok": True}
@@ -761,27 +787,34 @@ async def telegram_webhook(
         if not re.match(r"[^@]+@[^@]+\.[^@]+", email):
             await tg_send(chat_id, "❗ E-mail inválido. Tente novamente (ex.: `cliente@gmail.com`).")
             return {"ok": True}
+
+        # amarra no cliente
         set_client_email(chat_id_str, email)
+        # registra email e datas na licença
+        lic_key = temp_license or (get_client(chat_id_str) or {}).get("license_key")
+        if lic_key:
+            pg_update_license_email_and_dates(lic_key, email)
+
         set_pending(chat_id_str, None, None)
         await tg_send(chat_id, "✅ Obrigado! Configurando sua planilha de lançamentos...")
-        
+
         okf, errf, link = await setup_client_file(chat_id_str, email)
         if not okf:
             logger.error(f"ERRO CRÍTICO NO SETUP DO ARQUIVO: {errf}")
-            await tg_send(chat_id, f"❌ Falha na configuração: {errf}. Verifique os logs do servidor.")
+            await tg_send(chat_id, f"❌ Falha na configuração: {errf}.")
             return {"ok": True}
 
         await tg_send(chat_id, f"🚀 Planilha configurada com sucesso!\n🔗 {link}")
         await tg_send(chat_id, "Agora pode me contar seus gastos. Ex.: _gastei 45,90 no mercado via cartão hoje_")
         return {"ok": True}
 
-    # ===== exige licença =====
+    # exige licença válida
     ok, msg = require_active_license(chat_id_str)
     if not ok:
         await tg_send(chat_id, f"❗ {msg}")
         return {"ok": True}
 
-    # ===== Lançamento =====
+    # Lançamento
     row, err = parse_natural(text)
     if err:
         await tg_send(chat_id, f"❗ {err}")
