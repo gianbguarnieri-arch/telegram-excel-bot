@@ -1,4 +1,6 @@
-# app.py
+# app.py — FastAPI + Telegram + Google (OAuth) + Neon (Postgres)
+# Pronto para colar e fazer deploy.
+
 import os
 import json
 import secrets
@@ -27,7 +29,7 @@ logger = logging.getLogger("app")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_WEBHOOK_SECRET = (os.getenv("TELEGRAM_WEBHOOK_SECRET") or "").strip()
 
-# Admins (novos: múltiplos e username, + token de promoção)
+# Admins
 ADMIN_TELEGRAM_ID = (os.getenv("ADMIN_TELEGRAM_ID") or "").strip()
 ADMIN_TELEGRAM_IDS = [s.strip() for s in (os.getenv("ADMIN_TELEGRAM_IDS") or "").split(",") if s.strip()]
 ADMIN_TELEGRAM_USERNAME = (os.getenv("ADMIN_TELEGRAM_USERNAME") or "").lstrip("@").strip()
@@ -35,6 +37,7 @@ ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")  # ex: meu-segredo-admin-123
 
 DATABASE_URL = os.getenv("DATABASE_URL")  # Neon: postgres://...sslmode=require
 
+# Google (usar OAuth = 1, ou Service Account = 0)
 GOOGLE_USE_OAUTH = os.getenv("GOOGLE_USE_OAUTH", "0") == "1"
 GOOGLE_OAUTH_CLIENT_ID = os.getenv("GOOGLE_OAUTH_CLIENT_ID")
 GOOGLE_OAUTH_CLIENT_SECRET = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET")
@@ -43,7 +46,7 @@ GOOGLE_OAUTH_SCOPES = (os.getenv("GOOGLE_OAUTH_SCOPES") or
                        "https://www.googleapis.com/auth/drive https://www.googleapis.com/auth/spreadsheets").split()
 GOOGLE_TOKEN_PATH = os.getenv("GOOGLE_TOKEN_PATH", "/tmp/google_oauth_token.json")
 
-# (Mantemos suporte a SA, caso algum ambiente use)
+# (fallback para quem ainda usa SA em outro ambiente)
 GOOGLE_SA_JSON = os.getenv("GOOGLE_SA_JSON") or os.getenv("GOOGLE_SHEETS_CREDENTIALS")
 
 GS_TEMPLATE_ID = os.getenv("GS_TEMPLATE_ID")
@@ -97,7 +100,6 @@ CREATE TABLE IF NOT EXISTS client_files (
     created_at TIMESTAMPTZ NOT NULL
 );
 
--- NOVO: admins persistentes
 CREATE TABLE IF NOT EXISTS admins (
     chat_id TEXT PRIMARY KEY,
     username TEXT,
@@ -222,6 +224,25 @@ def _is_admin(chat_id_val: str, username: Optional[str]) -> bool:
             return True
     return False
 
+def _parse_licenca_nova_args(msg: str):
+    # aceita: /licenca nova [dias|0] [email] [CUSTOMKEY]
+    parts = msg.split()
+    if parts and "@" in parts[0]:
+        parts[0] = parts[0].split("@")[0]
+    custom_key = None
+    days = 30
+    email = None
+    tail = parts[2:] if len(parts) >= 2 and parts[1] == "nova" else []
+    for tok in tail:
+        t = tok.strip()
+        if t.isdigit():
+            days = int(t)
+        elif "@" in t and "." in t:
+            email = t
+        else:
+            custom_key = t
+    return custom_key, days, email
+
 # ----------------- Telegram ----------------
 async def tg_send(chat_id, text):
     async with httpx.AsyncClient(timeout=12) as client:
@@ -300,24 +321,37 @@ async def telegram_webhook(
         if not chat_id or not text:
             return {"ok": True}
 
-        # Parse robusto do comando (remove @SeuBot)
+        # Parser robusto (remove @SeuBot)
         raw = text.strip()
         parts = raw.split()
         cmd = parts[0].split("@")[0].lower() if parts else ""
         norm = _normalize_free(raw)
 
-        # Log mínimo pra diagnosticar admin
         logger.info({"from_id": chat_id, "from_username": username, "cmd": cmd})
 
-        # ---------- Admin ----------
+        # --- HOTFIX: responder /whoami sempre, independente de ser admin ---
         if cmd == "/whoami":
-            if _is_admin(chat_id, username):
-                await tg_send(chat_id, f"Você é admin ✅ (chat_id={chat_id})")
-            else:
-                await tg_send(chat_id, f"Você NÃO é admin ❌ (chat_id={chat_id})")
+            try:
+                is_admin_now = _is_admin(str(chat_id), username)
+            except Exception:
+                is_admin_now = False
+            who = (message.get("from") or {})
+            uname = who.get("username") or "-"
+            first = who.get("first_name") or "-"
+            await tg_send(
+                chat_id,
+                (
+                    "*whoami*\n"
+                    f"• chat_id: `{chat_id}`\n"
+                    f"• username: `{uname}`\n"
+                    f"• first_name: `{first}`\n"
+                    f"• admin: `{'true' if is_admin_now else 'false'}`"
+                )
+            )
             return {"ok": True}
+        # --- FIM HOTFIX ---
 
-        # Autopromoção a admin via token
+        # ---------- Admin ----------
         if cmd == "/admin":
             if not ADMIN_TOKEN:
                 await tg_send(chat_id, "ADMIN_TOKEN não configurado no servidor.")
@@ -337,29 +371,8 @@ async def telegram_webhook(
             await tg_send(chat_id, "✅ Admin habilitado para este chat.")
             return {"ok": True}
 
-        # Comandos que exigem admin
-        if _is_admin(chat_id, username):
+        if _is_admin(str(chat_id), username):
             if cmd == "/licenca" and "nova" in norm:
-                # aceita: /licenca nova [dias|0] [email] [CUSTOMKEY]
-                # (reuso do seu parser simples)
-                def _parse_licenca_nova_args(msg: str):
-                    p = msg.split()
-                    if p and "@" in p[0]:
-                        p[0] = p[0].split("@")[0]
-                    custom_key = None
-                    days = 30
-                    email = None
-                    tail = p[2:] if len(p) >= 2 and p[1] == "nova" else []
-                    for tok in tail:
-                        t = tok.strip()
-                        if t.isdigit():
-                            days = int(t)
-                        elif "@" in t and "." in t:
-                            email = t
-                        else:
-                            custom_key = t
-                    return custom_key, days, email
-
                 custom_key, days, email = _parse_licenca_nova_args(norm)
                 key, exp = create_license(days=None if days == 0 else days, custom_key=custom_key)
                 validade = "vitalícia" if not exp else exp
