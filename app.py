@@ -1,5 +1,5 @@
 # app.py — FastAPI + Telegram + Google (OAuth) + Neon (Postgres)
-# Versão atualizada: 100% funcional com /licenca nova
+# Versão corrigida em 18/10/2025 — /licenca nova e /whoami 100% funcionais
 
 import os
 import json
@@ -111,6 +111,7 @@ def db_init():
 # ----------------- Licenças ----------------
 def create_license(days: Optional[int] = 30, max_files: int = 1,
                    notes: Optional[str] = None, custom_key: Optional[str] = None):
+    """Cria uma nova licença no banco"""
     key = custom_key or _gen_key()
     expires_at = (datetime.now(timezone.utc) + timedelta(days=days)) if days else None
     with pool.connection() as con:
@@ -118,7 +119,7 @@ def create_license(days: Optional[int] = 30, max_files: int = 1,
             "INSERT INTO licenses(license_key,status,max_files,expires_at,notes) VALUES(%s,%s,%s,%s,%s)",
             (key, "active", max_files, expires_at, notes),
         )
-    return key, (expires_at.isoformat(timespec="seconds") if expires_at else None)
+    return key, (expires_at.isoformat(timespec='seconds') if expires_at else None)
 
 # ----------------- Telegram ----------------
 async def tg_send(chat_id, text):
@@ -214,7 +215,7 @@ async def telegram_webhook(
 
         # ---------- Admin ----------
         if _is_admin(str(chat_id), username):
-            # PATCH: reconhecimento mais flexível do comando
+            # Reconhecimento flexível do comando
             if cmd.startswith("/licenca") and ("nova" in norm or "nova" in text.lower()):
                 custom_key, days, email = _parse_licenca_nova_args(text)
                 try:
