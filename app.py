@@ -1,54 +1,70 @@
-# app.py — Telegram + FastAPI + Neon (Postgres) + (opcional) Google Sheets
-# Resiliente a nomes de colunas com acentos/hífens/variações: mapeia dinamicamente pelo information_schema.
+# app.py — Bot Telegram + FastAPI + Neon (Postgres) + (opcional) Google Sheets
+# Compatível com os nomes de coluna atuais no seu banco (PT-BR com acento/espaço/hífen).
 
 import os
 import json
 import time
-import re
-import unicodedata
-import random
+import secrets
 import string
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, List, Tuple
+from typing import Optional
 
-import psycopg
 import requests
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Header
 from fastapi.responses import JSONResponse
 
-# ========================= LOG =========================
+import psycopg
+from psycopg import sql
+
+# ============ LOG ============
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("bot")
 
-# ========================= ENVs ========================
+# ============ ENVs ============
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-ADMIN_TELEGRAM_ID = (os.getenv("ADMIN_TELEGRAM_ID") or "").strip()
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")  # opcional: /admin <TOKEN>
-
 DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
 if not DATABASE_URL:
     raise RuntimeError("Defina DATABASE_URL.")
+
+ADMIN_TELEGRAM_ID = (os.getenv("ADMIN_TELEGRAM_ID") or "").strip()
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")  # opcional: /admin <TOKEN>
+TELEGRAM_WEBHOOK_SECRET = (os.getenv("TELEGRAM_WEBHOOK_SECRET") or "").strip()
 
 # Google Sheets (opcional)
 LICENSE_SHEET_ID    = os.getenv("LICENSE_SHEET_ID")
 LICENSE_SHEET_TAB   = os.getenv("LICENSE_SHEET_TAB", "Licencas")
 LICENSE_SHEET_RANGE = os.getenv("LICENSE_SHEET_RANGE", f"{LICENSE_SHEET_TAB}!A:F")
-GOOGLE_USE_OAUTH  = os.getenv("GOOGLE_USE_OAUTH", "0") == "1"
-GOOGLE_TOKEN_PATH = os.getenv("GOOGLE_TOKEN_PATH", "/tmp/google_oauth_token.json")
-GOOGLE_SA_JSON    = os.getenv("GOOGLE_SA_JSON") or os.getenv("GOOGLE_SHEETS_CREDENTIALS")
-GOOGLE_SCOPES     = ["https://www.googleapis.com/auth/spreadsheets"]
+GOOGLE_USE_OAUTH    = os.getenv("GOOGLE_USE_OAUTH", "0") == "1"
+GOOGLE_TOKEN_PATH   = os.getenv("GOOGLE_TOKEN_PATH", "/tmp/google_oauth_token.json")
+GOOGLE_SA_JSON      = os.getenv("GOOGLE_SA_JSON") or os.getenv("GOOGLE_SHEETS_CREDENTIALS")
+GOOGLE_SCOPES       = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
 
-# ========================= APP =========================
+# ============ APP ============
 app = FastAPI()
 
-# ======================== UTILS ========================
+# ============ COLUNAS (NOMES EXATOS DO SEU BANCO) ============
+COL = {
+    "id":            'eu ia',
+    "license_key":   'chave_de_licença',
+    "email":         'e-mail',
+    "start_date":    'data_de_início',
+    "end_date":      'data_final',
+    "validity_days": 'dias_de_validade',
+    "max_files":     'arquivos_máx.',
+    "expires_at":    'expira_em',
+    "notes":         'notas',
+    "status":        'status',
+}
+
+# ============ UTILS ============
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
-def _gen_key(prefix="GF") -> str:
-    chars = string.ascii_uppercase + string.digits
-    return f"{prefix}-{''.join(random.choices(chars, k=4))}-{''.join(random.choices(chars, k=4))}"
+def _gen_license(prefix="GF") -> str:
+    alphabet = string.ascii_uppercase + string.digits
+    def part(n): return "".join(secrets.choice(alphabet) for _ in range(n))
+    return f"{prefix}-{part(4)}-{part(4)}"
 
 def tg_send(chat_id: int, text: str):
     try:
@@ -57,100 +73,25 @@ def tg_send(chat_id: int, text: str):
     except Exception as e:
         log.warning(f"Falha Telegram: {e}")
 
-def _exec_with_retry(sql: str, params: tuple = (), fetch: bool = False):
-    last = None
-    for i in range(3):
-        try:
-            with psycopg.connect(DATABASE_URL, sslmode="require", autocommit=True) as con:
-                with con.cursor() as cur:
-                    cur.execute(sql, params)
-                    if fetch:
-                        return cur.fetchall()
-            return
-        except Exception as e:
-            last = e
-            log.warning(f"DB retry {i+1}/3: {e}")
-            time.sleep(0.35 * (i + 1))
-    raise last
+def _exec(sql_text: str, params: tuple = (), fetch: bool = False):
+    with psycopg.connect(DATABASE_URL, sslmode="require", autocommit=True) as con:
+        with con.cursor() as cur:
+            cur.execute(sql_text, params)
+            if fetch:
+                return cur.fetchall()
 
-# -------- normalização robusta de identificadores -------
-_id_clean_re = re.compile(r"[^a-z0-9]+")
-def _norm_ident(s: str) -> str:
-    # remove diacríticos, lower, troca tudo que não é [a-z0-9] por _
-    s = unicodedata.normalize("NFKD", s)
-    s = "".join(c for c in s if not unicodedata.combining(c))
-    s = s.lower()
-    s = _id_clean_re.sub("_", s)
-    return s.strip("_")
+def _exec_sql(sql_obj, params: tuple = (), fetch: bool = False):
+    # versão que aceita psycopg.sql.SQL/Identifier (para nomes com acento/hífen)
+    with psycopg.connect(DATABASE_URL, sslmode="require", autocommit=True) as con:
+        with con.cursor() as cur:
+            cur.execute(sql_obj, params)
+            if fetch:
+                return cur.fetchall()
 
-# -------- mapeamento dinâmico dos nomes reais -----------
-_COLMAP_CACHE: Dict[str, str] = {}
+def _is_admin(chat_id: int) -> bool:
+    return ADMIN_TELEGRAM_ID and str(chat_id) == ADMIN_TELEGRAM_ID
 
-# chaves canônicas que queremos (sem acento)
-CANONICAL_KEYS = {
-    "license_key": ["chave_de_licenca", "licenca", "license_key", "chave"],
-    "status": ["status"],
-    "max_files": ["arquivos_max", "max_files", "arquivos", "maximos"],
-    "expires_at": ["expira_em", "expires_at", "data_expira"],
-    "notes": ["notas", "notes", "observacoes", "obs"],
-    "email": ["e_mail", "email"],
-    "start_date": ["data_de_inicio", "inicio", "start_date"],
-    "end_date": ["data_final", "fim", "end_date"],
-    "days": ["dias_de_validade", "dias", "validade_dias"],
-}
-
-def _load_column_map() -> Dict[str, str]:
-    """
-    Retorna um dicionário: {canonical_key -> "NomeRealComAspas"}
-    usando information_schema.columns, tolerando acentos/hífens/espaços.
-    """
-    global _COLMAP_CACHE
-    if _COLMAP_CACHE:
-        return _COLMAP_CACHE
-
-    rows = _exec_with_retry(
-        """
-        SELECT column_name
-        FROM information_schema.columns
-        WHERE table_name = 'licenses'
-        ORDER BY ordinal_position
-        """,
-        fetch=True
-    ) or []
-
-    # prepara listas normalizadas
-    norm_to_real: Dict[str, str] = {}
-    for (col_name,) in rows:
-        norm = _norm_ident(col_name)
-        norm_to_real[norm] = col_name  # salva nome EXATO
-
-    result: Dict[str, str] = {}
-    for canon, aliases in CANONICAL_KEYS.items():
-        found = None
-        for alias in aliases:
-            if alias in norm_to_real:
-                found = norm_to_real[alias]
-                break
-        # heurística extra: tentar variantes sem underscores
-        if not found:
-            for alias in aliases:
-                alias_no = alias.replace("_", "")
-                for norm, real in norm_to_real.items():
-                    if norm.replace("_", "") == alias_no:
-                        found = real
-                        break
-                if found:
-                    break
-        if found:
-            result[canon] = f"\"{found}\""  # sempre cita com aspas
-        else:
-            result[canon] = ""  # não encontrado
-
-    _COLMAP_CACHE = result
-    log.info({"colmap": _COLMAP_CACHE})
-    return result
-
-# -------------- Google Sheets (opcional) --------------
+# ============ Google Sheets (opcional) ============
 _sheets = None
 def _sheets_client():
     global _sheets
@@ -160,17 +101,15 @@ def _sheets_client():
         if GOOGLE_USE_OAUTH:
             from google.oauth2.credentials import Credentials
             if not os.path.exists(GOOGLE_TOKEN_PATH):
-                raise RuntimeError("OAuth token não encontrado.")
+                raise RuntimeError("OAuth token não encontrado (GOOGLE_TOKEN_PATH).")
             with open(GOOGLE_TOKEN_PATH, "r") as f:
-                data = json.load(f)
-            creds = Credentials.from_authorized_user_info(data, GOOGLE_SCOPES)
+                creds = Credentials.from_authorized_user_info(json.load(f), GOOGLE_SCOPES)
         else:
             from google.oauth2.service_account import Credentials as SACreds
             if not GOOGLE_SA_JSON:
                 raise RuntimeError("GOOGLE_SA_JSON ausente.")
             info = json.loads(GOOGLE_SA_JSON)
             creds = SACreds.from_service_account_info(info, scopes=GOOGLE_SCOPES)
-
         from googleapiclient.discovery import build
         _sheets = build("sheets", "v4", credentials=creds).spreadsheets()
     except Exception as e:
@@ -178,14 +117,14 @@ def _sheets_client():
         _sheets = None
     return _sheets
 
-def _sheet_row(key: str, days: Optional[int], start_dt: datetime,
+def _sheet_row(licenca: str, validade_dias: Optional[int], start_dt: datetime,
                end_dt: Optional[datetime], email: Optional[str], status: str):
-    validade = "vitalícia" if not days or days == 0 or not end_dt else str(days)
+    validade_cell = "vitalícia" if not validade_dias or validade_dias == 0 or not end_dt else str(validade_dias)
     inicio = start_dt.strftime("%Y-%m-%d %H:%M:%S")
     fim = end_dt.strftime("%Y-%m-%d %H:%M:%S") if end_dt else ""
-    return [key, validade, inicio, fim, (email or ""), status]
+    return [licenca, validade_cell, inicio, fim, (email or ""), status]
 
-def sheet_append_license(key: str, days: Optional[int], email: Optional[str],
+def sheet_append_license(licenca: str, validade_dias: Optional[int], email: Optional[str],
                          start_dt: datetime, end_dt: Optional[datetime], status: str = "active"):
     sc = _sheets_client()
     if not sc:
@@ -196,88 +135,138 @@ def sheet_append_license(key: str, days: Optional[int], email: Optional[str],
             range=LICENSE_SHEET_RANGE,
             valueInputOption="RAW",
             insertDataOption="INSERT_ROWS",
-            body={"values": [_sheet_row(key, days, start_dt, end_dt, email, status)]},
+            body={"values": [_sheet_row(licenca, validade_dias, start_dt, end_dt, email, status)]},
         ).execute()
     except Exception as e:
         log.warning(f"Sheets append falhou: {e}")
 
-# ================== CORE: LICENÇAS ====================
-def create_license(days: int = 30, max_files: int = 1,
-                   notes: Optional[str] = None, custom_key: Optional[str] = None,
-                   email_for_sheet: Optional[str] = None):
+# ============ CORE: LICENÇAS ============
+def create_license(days: int = 30, email: Optional[str] = None,
+                   notes: Optional[str] = None, max_files: int = 1, status: str = "active",
+                   custom_key: Optional[str] = None):
     """
-    Cria licença resolvendo dinamicamente os nomes reais das colunas da tabela 'licenses'.
-    Evita erros de 'column does not exist' causados por acentos/hífens/variações.
+    Cria licença usando os NOMES EXATOS da sua tabela.
+    Preenche sempre: chave_de_licença, e-mail, data_de_início, data_final, dias_de_validade,
+    arquivos_máx., expira_em, notas, status.
     """
-    key = custom_key or _gen_key()
+    key = custom_key or _gen_license()
     start_dt = _now_utc()
-    expires_at = start_dt + timedelta(days=days) if days else None
-    end_dt = expires_at
-    status_val = "active"
+    end_dt = (start_dt + timedelta(days=days)) if days and days > 0 else None
+    # expira_em no final do dia de end_dt (se houver)
+    expires_at = end_dt.replace(hour=23, minute=59, second=59, microsecond=0) if end_dt else None
 
-    col = _load_column_map()
+    log.info("create_license: INSERT usando colunas PT-BR com aspas/acentos")
 
-    # constrói lista de colunas/valores presentes no seu schema
-    cols: List[str] = []
-    vals: List = []
+    q = sql.SQL("""
+        INSERT INTO licenses (
+            {license_key},
+            {email},
+            {start_date},
+            {end_date},
+            {validity_days},
+            {max_files},
+            {expires_at},
+            {notes},
+            {status}
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        RETURNING {license_key}, {start_date}, {end_date}, {validity_days}, {status}
+    """).format(
+        license_key=sql.Identifier(COL["license_key"]),
+        email=sql.Identifier(COL["email"]),
+        start_date=sql.Identifier(COL["start_date"]),
+        end_date=sql.Identifier(COL["end_date"]),
+        validity_days=sql.Identifier(COL["validity_days"]),
+        max_files=sql.Identifier(COL["max_files"]),
+        expires_at=sql.Identifier(COL["expires_at"]),
+        notes=sql.Identifier(COL["notes"]),
+        status=sql.Identifier(COL["status"]),
+    )
 
-    # ordem não importa, mas tentamos manter lógico
-    for canon, value in [
-        ("license_key", key),
-        ("status", status_val),
-        ("max_files", max_files),
-        ("expires_at", expires_at),
-        ("notes", notes),
-        ("email", email_for_sheet),
-        ("start_date", start_dt),
-        ("end_date", end_dt),
-        ("days", days),
-    ]:
-        real = col.get(canon) or ""
-        if real:
-            cols.append(real)
-            vals.append(value)
+    row = _exec_sql(q, (
+        key,
+        email,
+        start_dt,
+        end_dt,
+        days,
+        max_files,
+        expires_at,
+        notes,
+        status,
+    ), fetch=True)
 
-    if not (col.get("license_key") and col.get("status")):
-        raise RuntimeError("Não encontrei colunas essenciais (license_key/status) na tabela 'licenses'.")
-
-    placeholders = ",".join(["%s"] * len(cols))
-    cols_sql = ", ".join(cols)
-    sql = f"INSERT INTO licenses ({cols_sql}) VALUES ({placeholders})"
-
-    log.info({"insert_sql": sql, "values_preview": str(vals)[:120]})
-    _exec_with_retry(sql, tuple(vals))
-
+    # Sheets (opcional)
     try:
-        sheet_append_license(key, days, email_for_sheet, start_dt, end_dt, status_val)
+        sheet_append_license(key, days, email, start_dt, end_dt, status)
     except Exception:
         log.exception("Falha ao escrever no Sheets (ignorado).")
 
-    return key, (expires_at.strftime("%Y-%m-%d %H:%M:%S") if expires_at else "vitalícia")
+    return key, (end_dt.strftime("%Y-%m-%d %H:%M:%S") if end_dt else "vitalícia")
 
-# ================== TELEGRAM BOT ======================
-def _is_admin(chat_id: int) -> bool:
-    return ADMIN_TELEGRAM_ID and str(chat_id) == ADMIN_TELEGRAM_ID
+def get_license_by_key(license_key: str):
+    q = sql.SQL("""
+        SELECT
+            {license_key}, {email}, {start_date}, {end_date},
+            {validity_days}, {max_files}, {expires_at}, {notes}, {status}
+        FROM licenses
+        WHERE {license_key} = %s
+        LIMIT 1
+    """).format(
+        license_key=sql.Identifier(COL["license_key"]),
+        email=sql.Identifier(COL["email"]),
+        start_date=sql.Identifier(COL["start_date"]),
+        end_date=sql.Identifier(COL["end_date"]),
+        validity_days=sql.Identifier(COL["validity_days"]),
+        max_files=sql.Identifier(COL["max_files"]),
+        expires_at=sql.Identifier(COL["expires_at"]),
+        notes=sql.Identifier(COL["notes"]),
+        status=sql.Identifier(COL["status"]),
+    )
+    rows = _exec_sql(q, (license_key,), fetch=True)
+    if not rows:
+        return None
+    r = rows[0]
+    return {
+        "license_key": r[0],
+        "email": r[1],
+        "start_date": r[2],
+        "end_date": r[3],
+        "validity_days": r[4],
+        "max_files": r[5],
+        "expires_at": r[6],
+        "notes": r[7],
+        "status": r[8],
+    }
 
+# ============ TELEGRAM ============
 @app.post("/telegram/webhook")
-async def telegram_webhook(request: Request):
+async def telegram_webhook(
+    request: Request,
+    x_telegram_bot_api_secret_token: Optional[str] = Header(default=None),
+):
+    # valida secret do webhook (se configurado)
+    if TELEGRAM_WEBHOOK_SECRET:
+        got = (x_telegram_bot_api_secret_token or "").strip()
+        if got != TELEGRAM_WEBHOOK_SECRET:
+            log.warning("Webhook rejeitado: secret inválido.")
+            return JSONResponse({"ok": True})
+
     body = await request.json()
     msg = body.get("message") or {}
     chat_id = msg.get("chat", {}).get("id")
     text = (msg.get("text") or "").strip()
 
     if not chat_id or not text:
-        return {"ok": True}
+        return JSONResponse({"ok": True})
 
     log.info({"from": chat_id, "text": text})
 
     if text.startswith("/start"):
-        tg_send(chat_id, "🤖 Bot ativo!\nUse: /whoami\nUse: /licenca nova <dias> [email]")
-        return {"ok": True}
+        tg_send(chat_id, "🤖 Bot ativo!\nComandos:\n/whoami\n/licenca nova <dias> [email]")
+        return JSONResponse({"ok": True})
 
     if text.startswith("/whoami"):
         tg_send(chat_id, f"• chatid: {chat_id}\n• admin: {'true' if _is_admin(chat_id) else 'false'}")
-        return {"ok": True}
+        return JSONResponse({"ok": True})
 
     if text.startswith("/admin"):
         parts = text.split(maxsplit=1)
@@ -287,37 +276,37 @@ async def telegram_webhook(request: Request):
             tg_send(chat_id, "✅ Admin habilitado neste chat.")
         else:
             tg_send(chat_id, "❌ Token inválido. Uso: /admin <TOKEN>")
-        return {"ok": True}
+        return JSONResponse({"ok": True})
 
     if text.lower().startswith("/licenca nova"):
         if not _is_admin(chat_id):
             tg_send(chat_id, "❌ Apenas admin pode criar licenças.")
-            return {"ok": True}
+            return JSONResponse({"ok": True})
 
         parts = text.split()
         if len(parts) < 3:
             tg_send(chat_id, "❌ Uso: /licenca nova <dias> [email]")
-            return {"ok": True}
+            return JSONResponse({"ok": True})
 
         try:
             days = int(parts[2])
         except Exception:
             tg_send(chat_id, "Dias inválidos. Ex.: /licenca nova 30 email@dominio.com")
-            return {"ok": True}
+            return JSONResponse({"ok": True})
 
         email = parts[3] if len(parts) > 3 else None
         try:
-            key, exp = create_license(days=days, email_for_sheet=email)
+            key, exp = create_license(days=days, email=email)
             tg_send(chat_id, f"✅ Licença criada!\n🔑 {key}\n📅 Validade: {exp}\n📧 {email or '(sem email)'}")
         except Exception as e:
             log.exception("Erro ao criar licença")
             tg_send(chat_id, f"❌ Erro ao criar licença: {e}")
-        return {"ok": True}
+        return JSONResponse({"ok": True})
 
     tg_send(chat_id, "❗ Comando não reconhecido. Use /start")
-    return {"ok": True}
+    return JSONResponse({"ok": True})
 
-# ================== Healthcheck =======================
+# ============ Health ============
 @app.get("/ping")
 def ping():
     return {"pong": True, "time": datetime.now(timezone.utc).isoformat(timespec="seconds")}
