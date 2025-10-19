@@ -1,5 +1,5 @@
-# app.py — Bot Telegram + FastAPI que usa Google Sheets como fonte de verdade
-# 2025-10-19 — grava/consulta/atualiza licenças apenas no Sheets (A:F)
+# app.py — Bot Telegram + FastAPI usando Google Sheets como fonte de verdade
+# Colunas esperadas no Sheets (aba "Licencas"): A=Licença, B=Validade, C=Data de inicio, D=Data final, E=email, F=status
 
 import os
 import json
@@ -21,12 +21,12 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("sheetsbot")
 
 # ----------------- envs --------------------
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") or ""
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 ADMIN_TELEGRAM_ID = (os.getenv("ADMIN_TELEGRAM_ID") or "").strip()
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")  # optional
+ADMIN_TOKEN = (os.getenv("ADMIN_TOKEN") or "").strip()  # opcional (para /admin <TOKEN>)
 TELEGRAM_WEBHOOK_SECRET = (os.getenv("TELEGRAM_WEBHOOK_SECRET") or "").strip()
 
-LICENSE_SHEET_ID = os.getenv("LICENSE_SHEET_ID")  # required
+LICENSE_SHEET_ID = (os.getenv("LICENSE_SHEET_ID") or "").strip()  # obrigatório
 LICENSE_SHEET_TAB = os.getenv("LICENSE_SHEET_TAB", "Licencas")
 LICENSE_SHEET_RANGE = os.getenv("LICENSE_SHEET_RANGE", f"{LICENSE_SHEET_TAB}!A:F")
 
@@ -37,7 +37,6 @@ GOOGLE_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 if not TELEGRAM_TOKEN:
     raise RuntimeError("Defina TELEGRAM_TOKEN")
-
 if not LICENSE_SHEET_ID:
     raise RuntimeError("Defina LICENSE_SHEET_ID")
 
@@ -47,6 +46,7 @@ app = FastAPI()
 # ------------- Google Sheets client ----------
 _sheets_service = None
 def get_sheets():
+    """Retorna cliente do Google Sheets (cacheado em memória)."""
     global _sheets_service
     if _sheets_service:
         return _sheets_service
@@ -71,16 +71,15 @@ def _now_str():
 def send_telegram(chat_id: int, text: str):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode":"Markdown"})
+        requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
     except Exception as e:
         log.warning("Erro enviando Telegram: %s", e)
 
 def _read_sheet_all() -> list:
-    """Retorna todas as linhas (a partir da 1) da planilha A:F"""
+    """Retorna todas as linhas (a partir da 1) do range A:F."""
     srv = get_sheets()
     resp = srv.values().get(spreadsheetId=LICENSE_SHEET_ID, range=LICENSE_SHEET_RANGE).execute()
-    vals = resp.get("values", [])
-    return vals
+    return resp.get("values", [])
 
 def _append_sheet_row(row: list):
     srv = get_sheets()
@@ -93,7 +92,6 @@ def _append_sheet_row(row: list):
     ).execute()
 
 def _update_sheet_row_by_index(row_index_1based: int, row: list):
-    # compute A{row_index}:F{row_index}
     rng = f"{LICENSE_SHEET_TAB}!A{row_index_1based}:F{row_index_1based}"
     srv = get_sheets()
     srv.values().update(
@@ -103,10 +101,9 @@ def _update_sheet_row_by_index(row_index_1based: int, row: list):
         body={"values": [row]},
     ).execute()
 
-def _find_license_row(license_key: str) -> Optional[Tuple[int,list]]:
+def _find_license_row(license_key: str) -> Optional[Tuple[int, list]]:
     """
     Busca pela chave na coluna A. Retorna (row_index_1based, row_values) ou None.
-    Note: returns first match.
     """
     vals = _read_sheet_all()
     for idx, r in enumerate(vals, start=1):
@@ -120,25 +117,30 @@ def _gen_key() -> str:
     def part(n): return "".join(secrets.choice(alphabet) for _ in range(n))
     return f"GF-{part(4)}-{part(4)}"
 
+def _promove_admin(chat_id: int):
+    """Atualiza ADMIN_TELEGRAM_ID de forma segura (corrige problema de 'global')."""
+    global ADMIN_TELEGRAM_ID
+    ADMIN_TELEGRAM_ID = str(chat_id)
+    os.environ["ADMIN_TELEGRAM_ID"] = ADMIN_TELEGRAM_ID
+
 # ------------- business logic ----------------
-def create_license_in_sheet(days: int = 30, email: Optional[str] = None) -> Tuple[str,str]:
+def create_license_in_sheet(days: int = 30, email: Optional[str] = None) -> Tuple[str, str]:
     key = _gen_key()
     start = datetime.now(timezone.utc)
-    end = (start + timedelta(days=days)) if days and days>0 else None
-    validade_cell = "vitalícia" if not days or days==0 else str(days)
+    end = (start + timedelta(days=days)) if days and days > 0 else None
+    validade_cell = "vitalícia" if not days or days == 0 else str(days)
     start_s = start.strftime("%Y-%m-%d %H:%M:%S")
     end_s = end.strftime("%Y-%m-%d %H:%M:%S") if end else ""
     status = "active"
     row = [key, validade_cell, start_s, end_s, email or "", status]
     _append_sheet_row(row)
-    return key, end_s or "vitalícia"
+    return key, (end_s or "vitalícia")
 
 def set_license_status_in_sheet(license_key: str, new_status: str) -> bool:
     found = _find_license_row(license_key)
     if not found:
         return False
     idx, row = found
-    # ensure row has 6 columns
     while len(row) < 6:
         row.append("")
     row[5] = new_status
@@ -150,7 +152,6 @@ def get_license_info_from_sheet(license_key: str) -> Optional[dict]:
     if not found:
         return None
     idx, row = found
-    # map safely A-F
     def col(i): return row[i] if i < len(row) else ""
     return {
         "row": idx,
@@ -162,10 +163,10 @@ def get_license_info_from_sheet(license_key: str) -> Optional[dict]:
         "status": col(5),
     }
 
-# ------------- Telegram webhook handlers -------------
+# ------------- Telegram webhook -------------
 @app.post("/telegram/webhook")
 async def webhook(request: Request, x_telegram_bot_api_secret_token: Optional[str] = Header(default=None)):
-    # optional secret validation
+    # validação opcional do secret
     if TELEGRAM_WEBHOOK_SECRET:
         got = (x_telegram_bot_api_secret_token or "").strip()
         if got != TELEGRAM_WEBHOOK_SECRET:
@@ -182,26 +183,34 @@ async def webhook(request: Request, x_telegram_bot_api_secret_token: Optional[st
     log.info("msg from %s: %s", chat_id, text)
 
     if text.startswith("/start"):
-        send_telegram(chat_id, "🤖 Bot ativo!\nComandos:\n/whoami\n/licenca nova <dias> [email]\n/licenca set <CHAVE> <status>\n/licenca info <CHAVE>")
+        send_telegram(
+            chat_id,
+            "🤖 Bot ativo!\n"
+            "Comandos:\n"
+            "/whoami\n"
+            "/licenca nova <dias> [email]\n"
+            "/licenca set <CHAVE> <status>\n"
+            "/licenca info <CHAVE>\n"
+            "/admin <TOKEN> (opcional)"
+        )
         return JSONResponse({"ok": True})
 
     if text.startswith("/whoami"):
-        send_telegram(chat_id, f"• chatid: `{chat_id}`\n• admin: `{'true' if str(chat_id)==ADMIN_TELEGRAM_ID else 'false'}`")
+        is_admin = 'true' if str(chat_id) == ADMIN_TELEGRAM_ID else 'false'
+        send_telegram(chat_id, f"• chatid: `{chat_id}`\n• admin: `{is_admin}`")
         return JSONResponse({"ok": True})
 
+    # promover admin com token (sem 'global' no meio do handler)
     if text.startswith("/admin"):
         parts = text.split(maxsplit=1)
-        if len(parts)==2 and ADMIN_TOKEN and parts[1].strip()==ADMIN_TOKEN:
-            # promote in-memory: set env var (session only)
-            os.environ["ADMIN_TELEGRAM_ID"] = str(chat_id)
-            global ADMIN_TELEGRAM_ID
-            ADMIN_TELEGRAM_ID = str(chat_id)
+        if len(parts) == 2 and ADMIN_TOKEN and parts[1].strip() == ADMIN_TOKEN:
+            _promove_admin(chat_id)
             send_telegram(chat_id, "✅ Você foi promovido a admin neste chat.")
         else:
             send_telegram(chat_id, "Uso: /admin <TOKEN>")
         return JSONResponse({"ok": True})
 
-    # Create license
+    # criar licença
     if text.lower().startswith("/licenca nova"):
         if str(chat_id) != ADMIN_TELEGRAM_ID:
             send_telegram(chat_id, "❌ Apenas admin pode criar licenças.")
@@ -211,11 +220,13 @@ async def webhook(request: Request, x_telegram_bot_api_secret_token: Optional[st
         if len(parts) < 3:
             send_telegram(chat_id, "Uso: /licenca nova <dias> [email]")
             return JSONResponse({"ok": True})
+
         try:
             days = int(parts[2])
         except Exception:
             send_telegram(chat_id, "Dias inválidos. Ex.: /licenca nova 30 email@dominio.com")
             return JSONResponse({"ok": True})
+
         email = parts[3] if len(parts) > 3 else None
         try:
             key, exp = create_license_in_sheet(days=days, email=email)
@@ -225,15 +236,17 @@ async def webhook(request: Request, x_telegram_bot_api_secret_token: Optional[st
             send_telegram(chat_id, f"❌ Erro ao criar licença: {e}")
         return JSONResponse({"ok": True})
 
-    # Set status: /licenca set <CHAVE> <status>
+    # alterar status
     if text.lower().startswith("/licenca set"):
         if str(chat_id) != ADMIN_TELEGRAM_ID:
             send_telegram(chat_id, "❌ Apenas admin pode alterar status.")
             return JSONResponse({"ok": True})
+
         parts = text.split()
         if len(parts) < 4:
             send_telegram(chat_id, "Uso: /licenca set <CHAVE> <novo_status>")
             return JSONResponse({"ok": True})
+
         chave = parts[2]
         novo = parts[3]
         ok = set_license_status_in_sheet(chave, novo)
@@ -243,7 +256,7 @@ async def webhook(request: Request, x_telegram_bot_api_secret_token: Optional[st
             send_telegram(chat_id, f"❌ Licença não encontrada: {chave}")
         return JSONResponse({"ok": True})
 
-    # Info: /licenca info <CHAVE>
+    # info
     if text.lower().startswith("/licenca info"):
         parts = text.split()
         if len(parts) < 3:
@@ -254,12 +267,14 @@ async def webhook(request: Request, x_telegram_bot_api_secret_token: Optional[st
         if not info:
             send_telegram(chat_id, f"❌ Licença não encontrada: {chave}")
         else:
-            msg = (f"*Licença:* `{info['license_key']}`\n"
-                   f"*Validade:* {info['validade']}\n"
-                   f"*Início:* {info['data_inicio']}\n"
-                   f"*Final:* {info['data_final']}\n"
-                   f"*Email:* {info['email']}\n"
-                   f"*Status:* {info['status']}")
+            msg = (
+                f"*Licença:* `{info['license_key']}`\n"
+                f"*Validade:* {info['validade']}\n"
+                f"*Início:* {info['data_inicio']}\n"
+                f"*Final:* {info['data_final']}\n"
+                f"*Email:* {info['email']}\n"
+                f"*Status:* {info['status']}"
+            )
             send_telegram(chat_id, msg)
         return JSONResponse({"ok": True})
 
