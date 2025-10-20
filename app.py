@@ -646,8 +646,8 @@ def detect_payment(text: str) -> str:
         return "💳 cartão"
     if "pix" in t: return "Pix"
     if "dinheiro" in t or "cash" in t: return "Dinheiro"
-    if "débito" in t ou "debito" in t: return "Débito"
-    if "crédito" in t ou "credito" in t: return "Crédito"
+    if "débito" in t or "debito" in t: return "Débito"
+    if "crédito" in t or "credito" in t: return "Crédito"
     return "Outros"
 
 def _detect_pagamento_fatura(text: str):
