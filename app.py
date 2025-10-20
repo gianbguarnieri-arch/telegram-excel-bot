@@ -5,6 +5,7 @@ import sqlite3
 import secrets
 import string
 import logging
+import unicodedata  # NEW
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple, List
 
@@ -70,7 +71,7 @@ SCOPES_SA = [
     "https://www.googleapis.com/auth/spreadsheets",
 ]
 
-# ======== NOVO: Licenças em Google Sheets =========
+# ======== Licenças em Google Sheets =========
 LICENSE_SHEET_ID  = os.getenv("LICENSE_SHEET_ID")
 LICENSE_SHEET_TAB = os.getenv("LICENSE_SHEET_TAB", "Licencas")
 
@@ -136,7 +137,7 @@ def _gen_key(prefix="GF"):
     part = lambda n: "".join(secrets.choice(alphabet) for _ in range(n))
     return f"{prefix}-{part(4)}-{part(4)}"
 
-# ======== ALTERADO: create_license usa Sheets se disponível =========
+# ======== create_license usa Sheets se disponível =========
 def create_license(days: Optional[int] = 30, max_files: int = 1, notes: Optional[str] = None, custom_key: Optional[str] = None):
     """
     Se LICENSE_SHEET_ID estiver definido → cria/append na planilha.
@@ -166,7 +167,7 @@ def create_license(days: Optional[int] = 30, max_files: int = 1, notes: Optional
     con.commit(); con.close()
     return key, expires_at
 
-# ======== ALTERADO: get_license lê do Sheets se disponível =========
+# ======== get_license lê do Sheets se disponível =========
 def get_license(license_key: str):
     """
     Se LICENSE_SHEET_ID estiver definido → lê da planilha.
@@ -427,7 +428,7 @@ def sheets_append_row(spreadsheet_id: str, sheet_name: str, values: List):
     ).execute()
 
 # ===========================
-# ======= NOVO BLOCO: Licenças em Google Sheets
+# ======= Licenças em Google Sheets
 # ===========================
 def _sheet_get_headers_and_rows():
     """
@@ -451,13 +452,13 @@ def _sheet_get_headers_and_rows():
 
 def _sheet_header_index_map(headers):
     """
-    Aceita exatamente estes nomes (case/acento ignorados):
+    Aceita estes nomes (case/acento ignorados):
       Licença | Validade | Data de inicio | Data final | email | status
     """
     def norm(s: str) -> str:
-        s = s.strip().lower()
-        s = s.replace("í", "i").replace("á", "a").replace("ã", "a")
-        return s
+        s = unicodedata.normalize("NFD", s or "")
+        s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")  # remove acentos/ç
+        return s.strip().lower()
     idx = {norm(h): i for i, h in enumerate(headers)}
     required = ["licenca", "validade", "data de inicio", "data final", "email", "status"]
     missing = [r for r in required if r not in idx]
@@ -473,6 +474,40 @@ def _sheet_find_row_idx_by_license(license_key: str) -> Optional[int]:
         if col < len(r) and (r[col] or "").strip().upper() == license_key.strip().upper():
             return i
     return None
+
+def _col_letter(col_zero_based: int) -> str:
+    # A..Z suficiente aqui (A-F), mas deixo generalizado
+    col = col_zero_based + 1
+    letters = ""
+    while col:
+        col, rem = divmod(col - 1, 26)
+        letters = chr(65 + rem) + letters
+    return letters
+
+def sheet_update_license_email(license_key: str, email: str):
+    """
+    Atualiza a célula da coluna 'email' na linha da licença informada.
+    """
+    if not LICENSE_SHEET_ID:
+        return  # nada a fazer se não usa planilha de licenças
+
+    row = _sheet_find_row_idx_by_license(license_key)
+    if not row:
+        raise RuntimeError(f"Licença '{license_key}' não encontrada na planilha de licenças.")
+
+    headers, _ = _sheet_get_headers_and_rows()
+    idx = _sheet_header_index_map(headers)
+    col_email = idx["email"]
+    col_letter = _col_letter(col_email)
+    rng = f"{LICENSE_SHEET_TAB}!{col_letter}{row}"
+
+    _, sheets = google_services()
+    sheets.spreadsheets().values().update(
+        spreadsheetId=LICENSE_SHEET_ID,
+        range=rng,
+        valueInputOption="USER_ENTERED",
+        body={"values": [[email]]}
+    ).execute()
 
 def sheet_get_license(license_key: str) -> Optional[dict]:
     """
@@ -611,8 +646,8 @@ def detect_payment(text: str) -> str:
         return "💳 cartão"
     if "pix" in t: return "Pix"
     if "dinheiro" in t or "cash" in t: return "Dinheiro"
-    if "débito" in t or "debito" in t: return "Débito"
-    if "crédito" in t or "credito" in t: return "Crédito"
+    if "débito" in t ou "debito" in t: return "Débito"
+    if "crédito" in t ou "credito" in t: return "Crédito"
     return "Outros"
 
 def _detect_pagamento_fatura(text: str):
@@ -904,6 +939,14 @@ async def telegram_webhook(
             return {"ok": True}
 
         set_client_email(chat_id_str, email)
+
+        # NEW: grava o e-mail na planilha de licenças
+        try:
+            if LICENSE_SHEET_ID:
+                sheet_update_license_email(token, email)
+        except Exception as e:
+            logger.error(f"Falha ao atualizar e-mail da licença no Sheets: {e}")
+
         await tg_send(chat_id, "✅ Obrigado! Configurando sua planilha de lançamentos...")
 
         okf, errf, link = await setup_client_file(chat_id_str, email)
@@ -939,6 +982,14 @@ async def telegram_webhook(
             await tg_send(chat_id, "❗ E-mail inválido. Tente novamente (ex.: `cliente@gmail.com`).")
             return {"ok": True}
         set_client_email(chat_id_str, email)
+
+        # NEW: atualiza a planilha de licenças usando a licença guardada em pending.temp_license
+        try:
+            if LICENSE_SHEET_ID and temp_license:
+                sheet_update_license_email(temp_license, email)
+        except Exception as e:
+            logger.error(f"Falha ao atualizar e-mail da licença no Sheets: {e}")
+
         set_pending(chat_id_str, None, None)
         await tg_send(chat_id, "✅ Obrigado! Configurando sua planilha de lançamentos...")
 
