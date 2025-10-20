@@ -70,6 +70,10 @@ SCOPES_SA = [
     "https://www.googleapis.com/auth/spreadsheets",
 ]
 
+# ======== NOVO: Licenças em Google Sheets =========
+LICENSE_SHEET_ID  = os.getenv("LICENSE_SHEET_ID")
+LICENSE_SHEET_TAB = os.getenv("LICENSE_SHEET_TAB", "Licencas")
+
 # ===========================
 # DB
 # ===========================
@@ -132,8 +136,29 @@ def _gen_key(prefix="GF"):
     part = lambda n: "".join(secrets.choice(alphabet) for _ in range(n))
     return f"{prefix}-{part(4)}-{part(4)}"
 
+# ======== ALTERADO: create_license usa Sheets se disponível =========
 def create_license(days: Optional[int] = 30, max_files: int = 1, notes: Optional[str] = None, custom_key: Optional[str] = None):
+    """
+    Se LICENSE_SHEET_ID estiver definido → cria/append na planilha.
+    Caso contrário, mantém o comportamento anterior (SQLite).
+    """
     key = custom_key or _gen_key()
+
+    if LICENSE_SHEET_ID:
+        # evita colisão improvável
+        if _sheet_find_row_idx_by_license(key):
+            while _sheet_find_row_idx_by_license(key):
+                key = _gen_key()
+
+        sheet_append_license(key, None if days == 0 else days, email=None)
+
+        # valor exibido ao admin: iso data final ou 'vitalícia'
+        exp = None
+        if days and days > 0:
+            exp = (datetime.now(timezone.utc) + timedelta(days=days)).date().strftime("%Y-%m-%d")
+        return key, exp
+
+    # --- fallback SQLite (como antes) ---
     expires_at = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat(timespec="seconds") if days else None
     con = _db()
     con.execute("INSERT INTO licenses(license_key,status,max_files,expires_at,notes) VALUES(?,?,?,?,?)",
@@ -141,7 +166,16 @@ def create_license(days: Optional[int] = 30, max_files: int = 1, notes: Optional
     con.commit(); con.close()
     return key, expires_at
 
+# ======== ALTERADO: get_license lê do Sheets se disponível =========
 def get_license(license_key: str):
+    """
+    Se LICENSE_SHEET_ID estiver definido → lê da planilha.
+    Caso contrário, mantém o comportamento anterior (SQLite).
+    """
+    if LICENSE_SHEET_ID:
+        return sheet_get_license(license_key)
+
+    # --- fallback SQLite ---
     con = _db()
     cur = con.execute("SELECT license_key,status,max_files,expires_at,notes FROM licenses WHERE license_key=?",
                       (license_key,))
@@ -390,6 +424,107 @@ def sheets_append_row(spreadsheet_id: str, sheet_name: str, values: List):
         valueInputOption="USER_ENTERED",
         insertDataOption="OVERWRITE",  # não insere linha; escreve na próxima vazia da faixa
         body=body
+    ).execute()
+
+# ===========================
+# ======= NOVO BLOCO: Licenças em Google Sheets
+# ===========================
+def _sheet_get_headers_and_rows():
+    """
+    Lê cabeçalho (linha 1) e todas as linhas seguintes da aba de licenças.
+    Requer LICENSE_SHEET_ID configurado.
+    """
+    if not LICENSE_SHEET_ID:
+        raise RuntimeError("LICENSE_SHEET_ID não configurado.")
+
+    _, sheets = google_services()
+    rng = f"{LICENSE_SHEET_TAB}!A:Z"
+    resp = sheets.spreadsheets().values().get(
+        spreadsheetId=LICENSE_SHEET_ID, range=rng, majorDimension="ROWS"
+    ).execute()
+    values = resp.get("values", [])
+    if not values:
+        raise RuntimeError("A aba de licenças está vazia (sem cabeçalho).")
+    headers = [h.strip() for h in values[0]]
+    rows = values[1:]
+    return headers, rows
+
+def _sheet_header_index_map(headers):
+    """
+    Aceita exatamente estes nomes (case/acento ignorados):
+      Licença | Validade | Data de inicio | Data final | email | status
+    """
+    def norm(s: str) -> str:
+        s = s.strip().lower()
+        s = s.replace("í", "i").replace("á", "a").replace("ã", "a")
+        return s
+    idx = {norm(h): i for i, h in enumerate(headers)}
+    required = ["licenca", "validade", "data de inicio", "data final", "email", "status"]
+    missing = [r for r in required if r not in idx]
+    if missing:
+        raise RuntimeError(f"Cabeçalho de licenças incompleto. Faltando: {', '.join(missing)}")
+    return idx
+
+def _sheet_find_row_idx_by_license(license_key: str) -> Optional[int]:
+    headers, rows = _sheet_get_headers_and_rows()
+    idx = _sheet_header_index_map(headers)
+    col = idx["licenca"]
+    for i, r in enumerate(rows, start=2):  # linha real (1=cabeçalho)
+        if col < len(r) and (r[col] or "").strip().upper() == license_key.strip().upper():
+            return i
+    return None
+
+def sheet_get_license(license_key: str) -> Optional[dict]:
+    """
+    Retorna no formato esperado por is_license_valid():
+      { license_key, status, max_files, expires_at, notes }
+    Onde expires_at é ISO datetime com TZ (ex.: '2025-11-19T23:59:59+00:00') ou None.
+    """
+    headers, rows = _sheet_get_headers_and_rows()
+    idx = _sheet_header_index_map(headers)
+
+    for r in rows:
+        key = (r[idx["licenca"]] if idx["licenca"] < len(r) else "").strip().upper()
+        if key == license_key.strip().upper():
+            status = (r[idx["status"]] if idx["status"] < len(r) else "").strip().lower() or "active"
+            end    = (r[idx["data final"]] if idx["data final"] < len(r) else "").strip()
+            expires_at = None
+            if end:
+                # transforma 'YYYY-MM-DD' em 'YYYY-MM-DDT23:59:59+00:00'
+                expires_at = f"{end}T23:59:59+00:00"
+            return {
+                "license_key": license_key,
+                "status": status,
+                "max_files": 1,   # planilha não controla isso por enquanto
+                "expires_at": expires_at,
+                "notes": None,
+            }
+    return None
+
+def sheet_append_license(license_key: str, days: Optional[int], email: Optional[str] = None):
+    """
+    Insere nova linha: Licença | Validade(dias) | Data de inicio | Data final | email | status
+    """
+    start_date = datetime.now(timezone.utc).date()
+    start_iso = start_date.strftime("%Y-%m-%d")
+    end_iso   = (start_date + timedelta(days=days)).strftime("%Y-%m-%d") if days else ""
+
+    _, sheets = google_services()
+    values = [[
+        license_key,
+        "" if (days is None or days == 0) else str(days),
+        start_iso,
+        end_iso,
+        email or "",
+        "active",
+    ]]
+    rng = f"{LICENSE_SHEET_TAB}!A:F"
+    sheets.spreadsheets().values().append(
+        spreadsheetId=LICENSE_SHEET_ID,
+        range=rng,
+        valueInputOption="USER_ENTERED",
+        insertDataOption="INSERT_ROWS",
+        body={"values": values},
     ).execute()
 
 # ===========================
