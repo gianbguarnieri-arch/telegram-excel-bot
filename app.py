@@ -70,7 +70,7 @@ SCOPES_SA = [
     "https://www.googleapis.com/auth/spreadsheets",
 ]
 
-# ======== Licenças em Google Sheets =========
+# ======== NOVO: Licenças em Google Sheets =========
 LICENSE_SHEET_ID  = os.getenv("LICENSE_SHEET_ID")
 LICENSE_SHEET_TAB = os.getenv("LICENSE_SHEET_TAB", "Licencas")
 
@@ -136,7 +136,7 @@ def _gen_key(prefix="GF"):
     part = lambda n: "".join(secrets.choice(alphabet) for _ in range(n))
     return f"{prefix}-{part(4)}-{part(4)}"
 
-# ======== create/get license com suporte a Sheets =========
+# ======== ALTERADO: create_license usa Sheets se disponível =========
 def create_license(days: Optional[int] = 30, max_files: int = 1, notes: Optional[str] = None, custom_key: Optional[str] = None):
     """
     Se LICENSE_SHEET_ID estiver definido → cria/append na planilha.
@@ -166,6 +166,7 @@ def create_license(days: Optional[int] = 30, max_files: int = 1, notes: Optional
     con.commit(); con.close()
     return key, expires_at
 
+# ======== ALTERADO: get_license lê do Sheets se disponível =========
 def get_license(license_key: str):
     """
     Se LICENSE_SHEET_ID estiver definido → lê da planilha.
@@ -421,12 +422,12 @@ def sheets_append_row(spreadsheet_id: str, sheet_name: str, values: List):
         spreadsheetId=spreadsheet_id,
         range=rng,
         valueInputOption="USER_ENTERED",
-        insertDataOption="OVERWRITE",
+        insertDataOption="OVERWRITE",  # não insere linha; escreve na próxima vazia da faixa
         body=body
     ).execute()
 
 # ===========================
-# Licenças em Google Sheets
+# ======= NOVO BLOCO: Licenças em Google Sheets
 # ===========================
 def _sheet_get_headers_and_rows():
     """
@@ -448,28 +449,16 @@ def _sheet_get_headers_and_rows():
     rows = values[1:]
     return headers, rows
 
-def _header_norm(s: str) -> str:
-    s = (s or "").strip().lower()
-    # normalização simples de acentos (inclui ç)
-    repl = (
-        ("á", "a"), ("à", "a"), ("â", "a"), ("ã", "a"),
-        ("é", "e"), ("è", "e"), ("ê", "e"),
-        ("í", "i"), ("ì", "i"),
-        ("ó", "o"), ("ò", "o"), ("ô", "o"), ("õ", "o"),
-        ("ú", "u"), ("ù", "u"), ("û", "u"),
-        ("ç", "c"),
-    )
-    for a, b in repl:
-        s = s.replace(a, b)
-    s = " ".join(s.split())
-    return s
-
 def _sheet_header_index_map(headers):
     """
-    Aceita estes nomes (case/acento ignorados):
+    Aceita exatamente estes nomes (case/acento ignorados):
       Licença | Validade | Data de inicio | Data final | email | status
     """
-    idx = {_header_norm(h): i for i, h in enumerate(headers)}
+    def norm(s: str) -> str:
+        s = s.strip().lower()
+        s = s.replace("í", "i").replace("á", "a").replace("ã", "a")
+        return s
+    idx = {norm(h): i for i, h in enumerate(headers)}
     required = ["licenca", "validade", "data de inicio", "data final", "email", "status"]
     missing = [r for r in required if r not in idx]
     if missing:
@@ -514,7 +503,7 @@ def sheet_get_license(license_key: str) -> Optional[dict]:
 
 def sheet_append_license(license_key: str, days: Optional[int], email: Optional[str] = None):
     """
-    Insere nova linha: Licenca | Validade(dias) | Data de inicio | Data final | email | status
+    Insere nova linha: Licença | Validade(dias) | Data de inicio | Data final | email | status
     """
     start_date = datetime.now(timezone.utc).date()
     start_iso = start_date.strftime("%Y-%m-%d")
@@ -536,59 +525,6 @@ def sheet_append_license(license_key: str, days: Optional[int], email: Optional[
         valueInputOption="USER_ENTERED",
         insertDataOption="INSERT_ROWS",
         body={"values": values},
-    ).execute()
-
-def sheet_update_email(license_key: str, email: str):
-    """
-    Localiza a linha pela coluna 'Licenca' e atualiza a coluna 'email'.
-    """
-    if not LICENSE_SHEET_ID or not LICENSE_SHEET_TAB:
-        return
-
-    _, sheets = google_services()
-
-    rng = f"{LICENSE_SHEET_TAB}!A1:F"
-    resp = sheets.spreadsheets().values().get(
-        spreadsheetId=LICENSE_SHEET_ID,
-        range=rng
-    ).execute()
-    values = resp.get("values", [])
-    if not values:
-        return
-
-    header = values[0]
-    header_lower = [h.strip().lower() for h in header]
-
-    try:
-        col_idx_lic = header_lower.index("licenca")
-        col_idx_email = header_lower.index("email")
-    except ValueError:
-        return
-
-    row_idx_found = None
-    for i, row in enumerate(values[1:], start=2):
-        if len(row) > col_idx_lic and row[col_idx_lic].strip() == license_key.strip():
-            row_idx_found = i
-            break
-    if not row_idx_found:
-        return
-
-    def _col_letter(idx0: int) -> str:
-        idx = idx0 + 1
-        out = ""
-        while idx:
-            idx, r = divmod(idx - 1, 26)
-            out = chr(65 + r) + out
-        return out
-
-    email_col_letter = _col_letter(col_idx_email)
-    cell_range = f"{LICENSE_SHEET_TAB}!{email_col_letter}{row_idx_found}"
-
-    sheets.spreadsheets().values().update(
-        spreadsheetId=LICENSE_SHEET_ID,
-        range=cell_range,
-        valueInputOption="RAW",
-        body={"values": [[email]]}
     ).execute()
 
 # ===========================
@@ -746,7 +682,7 @@ def detect_installments(text: str) -> str:
     m = re.search(r"(\d{1,2})x", t)
     if m: return f"{m.group(1)}x"
     if "parcelad" in t: return "parcelado"
-    if "à vista" in t ou "a vista" in t or "avista" in t: return "à vista"
+    if "à vista" in t or "a vista" in t or "avista" in t: return "à vista"
     return "à vista"
 
 def parse_natural(text: str) -> Tuple[Optional[List], Optional[str]]:
@@ -968,12 +904,6 @@ async def telegram_webhook(
             return {"ok": True}
 
         set_client_email(chat_id_str, email)
-        # >>> Atualiza e-mail no Sheets para esta licença
-        try:
-            sheet_update_email(token, email)
-        except Exception as e:
-            logger.warning(f"Falha ao atualizar email no Sheets para {token}: {e}")
-
         await tg_send(chat_id, "✅ Obrigado! Configurando sua planilha de lançamentos...")
 
         okf, errf, link = await setup_client_file(chat_id_str, email)
@@ -1009,13 +939,6 @@ async def telegram_webhook(
             await tg_send(chat_id, "❗ E-mail inválido. Tente novamente (ex.: `cliente@gmail.com`).")
             return {"ok": True}
         set_client_email(chat_id_str, email)
-        # >>> Atualiza e-mail no Sheets usando a licença temporária
-        try:
-            if temp_license:
-                sheet_update_email(temp_license, email)
-        except Exception as e:
-            logger.warning(f"Falha ao atualizar email no Sheets para {temp_license}: {e}")
-
         set_pending(chat_id_str, None, None)
         await tg_send(chat_id, "✅ Obrigado! Configurando sua planilha de lançamentos...")
 
