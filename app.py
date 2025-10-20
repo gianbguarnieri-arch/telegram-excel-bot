@@ -1,288 +1,294 @@
-# app.py — Bot Telegram + FastAPI usando Google Sheets como fonte de verdade
-# Colunas esperadas no Sheets (aba "Licencas"): A=Licença, B=Validade, C=Data de inicio, D=Data final, E=email, F=status
-
 import os
 import json
+import secrets
+import string
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
-import requests
+import httpx
 from fastapi import FastAPI, Request, Header
-from fastapi.responses import JSONResponse
+from fastapi.responses import RedirectResponse, PlainTextResponse, JSONResponse
 
-# Google
-from googleapiclient.discovery import build
-from google.oauth2 import service_account
+# Google OAuth / Sheets
+from google_auth_oauthlib.flow import Flow
 from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
-# ----------------- logging -----------------
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("sheetsbot")
+log = logging.getLogger("bot")
 
-# ----------------- envs --------------------
+app = FastAPI(title="Telegram + Sheets (OAuth)")
+
+# ============================ ENVs ================================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-ADMIN_TELEGRAM_ID = (os.getenv("ADMIN_TELEGRAM_ID") or "").strip()
-ADMIN_TOKEN = (os.getenv("ADMIN_TOKEN") or "").strip()  # opcional (para /admin <TOKEN>)
-TELEGRAM_WEBHOOK_SECRET = (os.getenv("TELEGRAM_WEBHOOK_SECRET") or "").strip()
+ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID", "").strip()
+TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
 
-LICENSE_SHEET_ID = (os.getenv("LICENSE_SHEET_ID") or "").strip()  # obrigatório
-LICENSE_SHEET_TAB = os.getenv("LICENSE_SHEET_TAB", "Licencas")
-LICENSE_SHEET_RANGE = os.getenv("LICENSE_SHEET_RANGE", f"{LICENSE_SHEET_TAB}!A:F")
-
-GOOGLE_USE_OAUTH = os.getenv("GOOGLE_USE_OAUTH", "0") == "1"
+# Google OAuth (obrigatório neste modo)
+GOOGLE_USE_OAUTH = True
+GOOGLE_OAUTH_CLIENT_ID = os.getenv("GOOGLE_OAUTH_CLIENT_ID")
+GOOGLE_OAUTH_CLIENT_SECRET = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET")
+GOOGLE_OAUTH_REDIRECT_URI = os.getenv("GOOGLE_OAUTH_REDIRECT_URI")
+GOOGLE_OAUTH_SCOPES = (os.getenv("GOOGLE_OAUTH_SCOPES") or
+    "https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive").split()
 GOOGLE_TOKEN_PATH = os.getenv("GOOGLE_TOKEN_PATH", "/tmp/google_oauth_token.json")
-GOOGLE_SA_JSON = os.getenv("GOOGLE_SA_JSON") or os.getenv("GOOGLE_SHEETS_CREDENTIALS")
-GOOGLE_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-if not TELEGRAM_TOKEN:
-    raise RuntimeError("Defina TELEGRAM_TOKEN")
-if not LICENSE_SHEET_ID:
-    raise RuntimeError("Defina LICENSE_SHEET_ID")
+# Planilha de Licenças
+# Colunas: A:Licença | B:Validade | C:Data de inicio | D:Data final | E:email | F:status
+LICENSE_SHEET_ID   = os.getenv("LICENSE_SHEET_ID", "").strip()      # ID da planilha
+LICENSE_SHEET_TAB  = os.getenv("LICENSE_SHEET_TAB", "Licencas").strip()
+LICENSE_SHEET_RANGE = os.getenv("LICENSE_SHEET_RANGE", f"{LICENSE_SHEET_TAB}!A:F").strip()
 
-# --------------- app -----------------------
-app = FastAPI()
+# Compartilhamento ao criar links (não usamos aqui, mas mantido caso evolua)
+SHARE_LINK_ROLE = os.getenv("SHARE_LINK_ROLE", "writer")
 
-# ------------- Google Sheets client ----------
-_sheets_service = None
-def get_sheets():
-    """Retorna cliente do Google Sheets (cacheado em memória)."""
-    global _sheets_service
-    if _sheets_service:
-        return _sheets_service
-    if GOOGLE_USE_OAUTH:
-        if not os.path.exists(GOOGLE_TOKEN_PATH):
-            raise RuntimeError("GOOGLE_TOKEN_PATH não encontrado.")
-        with open(GOOGLE_TOKEN_PATH, "r") as f:
-            info = json.load(f)
-        creds = Credentials.from_authorized_user_info(info, GOOGLE_SCOPES)
-    else:
-        if not GOOGLE_SA_JSON:
-            raise RuntimeError("GOOGLE_SA_JSON não definido.")
-        info = json.loads(GOOGLE_SA_JSON)
-        creds = service_account.Credentials.from_service_account_info(info, scopes=GOOGLE_SCOPES)
-    _sheets_service = build("sheets", "v4", credentials=creds).spreadsheets()
-    return _sheets_service
+# ============================ Helpers Gerais ======================
+def _now_tz() -> datetime:
+    return datetime.now(timezone.utc)
 
-# ------------- helpers ----------------------
-def _now_str():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+def _fmt_date(dt: datetime) -> str:
+    # Mostra em YYYY-MM-DD HH:MM (UTC) para padronizar
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M")
 
-def send_telegram(chat_id: int, text: str):
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
-    except Exception as e:
-        log.warning("Erro enviando Telegram: %s", e)
-
-def _read_sheet_all() -> list:
-    """Retorna todas as linhas (a partir da 1) do range A:F."""
-    srv = get_sheets()
-    resp = srv.values().get(spreadsheetId=LICENSE_SHEET_ID, range=LICENSE_SHEET_RANGE).execute()
-    return resp.get("values", [])
-
-def _append_sheet_row(row: list):
-    srv = get_sheets()
-    srv.values().append(
-        spreadsheetId=LICENSE_SHEET_ID,
-        range=LICENSE_SHEET_RANGE,
-        valueInputOption="RAW",
-        insertDataOption="INSERT_ROWS",
-        body={"values": [row]},
-    ).execute()
-
-def _update_sheet_row_by_index(row_index_1based: int, row: list):
-    rng = f"{LICENSE_SHEET_TAB}!A{row_index_1based}:F{row_index_1based}"
-    srv = get_sheets()
-    srv.values().update(
-        spreadsheetId=LICENSE_SHEET_ID,
-        range=rng,
-        valueInputOption="RAW",
-        body={"values": [row]},
-    ).execute()
-
-def _find_license_row(license_key: str) -> Optional[Tuple[int, list]]:
-    """
-    Busca pela chave na coluna A. Retorna (row_index_1based, row_values) ou None.
-    """
-    vals = _read_sheet_all()
-    for idx, r in enumerate(vals, start=1):
-        if len(r) >= 1 and r[0].strip() == license_key:
-            return idx, r
-    return None
-
-def _gen_key() -> str:
-    import secrets, string
+def _gen_license(prefix="GF") -> str:
     alphabet = string.ascii_uppercase + string.digits
-    def part(n): return "".join(secrets.choice(alphabet) for _ in range(n))
-    return f"GF-{part(4)}-{part(4)}"
+    part = lambda n: "".join(secrets.choice(alphabet) for _ in range(n))
+    return f"{prefix}-{part(4)}-{part(4)}"
 
-def _promove_admin(chat_id: int):
-    """Atualiza ADMIN_TELEGRAM_ID de forma segura (corrige problema de 'global')."""
-    global ADMIN_TELEGRAM_ID
-    ADMIN_TELEGRAM_ID = str(chat_id)
-    os.environ["ADMIN_TELEGRAM_ID"] = ADMIN_TELEGRAM_ID
+def _is_admin(chat_id) -> bool:
+    return ADMIN_TELEGRAM_ID != "" and str(chat_id).strip() == ADMIN_TELEGRAM_ID
 
-# ------------- business logic ----------------
-def create_license_in_sheet(days: int = 30, email: Optional[str] = None) -> Tuple[str, str]:
-    key = _gen_key()
-    start = datetime.now(timezone.utc)
-    end = (start + timedelta(days=days)) if days and days > 0 else None
-    validade_cell = "vitalícia" if not days or days == 0 else str(days)
-    start_s = start.strftime("%Y-%m-%d %H:%M:%S")
-    end_s = end.strftime("%Y-%m-%d %H:%M:%S") if end else ""
-    status = "active"
-    row = [key, validade_cell, start_s, end_s, email or "", status]
-    _append_sheet_row(row)
-    return key, (end_s or "vitalícia")
-
-def set_license_status_in_sheet(license_key: str, new_status: str) -> bool:
-    found = _find_license_row(license_key)
-    if not found:
-        return False
-    idx, row = found
-    while len(row) < 6:
-        row.append("")
-    row[5] = new_status
-    _update_sheet_row_by_index(idx, row)
-    return True
-
-def get_license_info_from_sheet(license_key: str) -> Optional[dict]:
-    found = _find_license_row(license_key)
-    if not found:
-        return None
-    idx, row = found
-    def col(i): return row[i] if i < len(row) else ""
-    return {
-        "row": idx,
-        "license_key": col(0),
-        "validade": col(1),
-        "data_inicio": col(2),
-        "data_final": col(3),
-        "email": col(4),
-        "status": col(5),
-    }
-
-# ------------- Telegram webhook -------------
-@app.post("/telegram/webhook")
-async def webhook(request: Request, x_telegram_bot_api_secret_token: Optional[str] = Header(default=None)):
-    # validação opcional do secret
-    if TELEGRAM_WEBHOOK_SECRET:
-        got = (x_telegram_bot_api_secret_token or "").strip()
-        if got != TELEGRAM_WEBHOOK_SECRET:
-            log.warning("Webhook secret mismatch")
-            return JSONResponse({"ok": True})
-
-    body = await request.json()
-    msg = body.get("message") or {}
-    chat_id = msg.get("chat", {}).get("id")
-    text = (msg.get("text") or "").strip()
-    if not chat_id or not text:
-        return JSONResponse({"ok": True})
-
-    log.info("msg from %s: %s", chat_id, text)
-
-    if text.startswith("/start"):
-        send_telegram(
-            chat_id,
-            "🤖 Bot ativo!\n"
-            "Comandos:\n"
-            "/whoami\n"
-            "/licenca nova <dias> [email]\n"
-            "/licenca set <CHAVE> <status>\n"
-            "/licenca info <CHAVE>\n"
-            "/admin <TOKEN> (opcional)"
-        )
-        return JSONResponse({"ok": True})
-
-    if text.startswith("/whoami"):
-        is_admin = 'true' if str(chat_id) == ADMIN_TELEGRAM_ID else 'false'
-        send_telegram(chat_id, f"• chatid: `{chat_id}`\n• admin: `{is_admin}`")
-        return JSONResponse({"ok": True})
-
-    # promover admin com token (sem 'global' no meio do handler)
-    if text.startswith("/admin"):
-        parts = text.split(maxsplit=1)
-        if len(parts) == 2 and ADMIN_TOKEN and parts[1].strip() == ADMIN_TOKEN:
-            _promove_admin(chat_id)
-            send_telegram(chat_id, "✅ Você foi promovido a admin neste chat.")
-        else:
-            send_telegram(chat_id, "Uso: /admin <TOKEN>")
-        return JSONResponse({"ok": True})
-
-    # criar licença
-    if text.lower().startswith("/licenca nova"):
-        if str(chat_id) != ADMIN_TELEGRAM_ID:
-            send_telegram(chat_id, "❌ Apenas admin pode criar licenças.")
-            return JSONResponse({"ok": True})
-
-        parts = text.split()
-        if len(parts) < 3:
-            send_telegram(chat_id, "Uso: /licenca nova <dias> [email]")
-            return JSONResponse({"ok": True})
-
+async def tg_send(chat_id, text):
+    if not TELEGRAM_TOKEN:
+        log.warning("TELEGRAM_TOKEN vazio; não enviando mensagem.")
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    async with httpx.AsyncClient(timeout=12) as client:
         try:
-            days = int(parts[2])
-        except Exception:
-            send_telegram(chat_id, "Dias inválidos. Ex.: /licenca nova 30 email@dominio.com")
-            return JSONResponse({"ok": True})
-
-        email = parts[3] if len(parts) > 3 else None
-        try:
-            key, exp = create_license_in_sheet(days=days, email=email)
-            send_telegram(chat_id, f"✅ Licença criada\n`{key}`\nValidade: {exp}\nEmail: {email or '(sem email)'}")
+            await client.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
         except Exception as e:
-            log.exception("Erro criando licença")
-            send_telegram(chat_id, f"❌ Erro ao criar licença: {e}")
-        return JSONResponse({"ok": True})
+            log.error(f"Falha Telegram: {e}")
 
-    # alterar status
-    if text.lower().startswith("/licenca set"):
-        if str(chat_id) != ADMIN_TELEGRAM_ID:
-            send_telegram(chat_id, "❌ Apenas admin pode alterar status.")
-            return JSONResponse({"ok": True})
+# ============================ OAuth Google ========================
+def _flow() -> Flow:
+    # client_config no formato "web"
+    return Flow(
+        client_type="web",
+        client_config={
+            "web": {
+                "client_id": GOOGLE_OAUTH_CLIENT_ID,
+                "client_secret": GOOGLE_OAUTH_CLIENT_SECRET,
+                "redirect_uris": [GOOGLE_OAUTH_REDIRECT_URI],
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token",
+            }
+        },
+        scopes=GOOGLE_OAUTH_SCOPES,
+        redirect_uri=GOOGLE_OAUTH_REDIRECT_URI,
+    )
 
-        parts = text.split()
-        if len(parts) < 4:
-            send_telegram(chat_id, "Uso: /licenca set <CHAVE> <novo_status>")
-            return JSONResponse({"ok": True})
+def _credentials_from_disk() -> Optional[Credentials]:
+    # Lê o arquivo salvo pelo callback
+    if not os.path.exists(GOOGLE_TOKEN_PATH):
+        return None
+    try:
+        with open(GOOGLE_TOKEN_PATH, "r") as f:
+            data = json.load(f)
+        return Credentials.from_authorized_user_info(data)
+    except Exception as e:
+        log.error(f"Erro lendo GOOGLE_TOKEN_PATH: {e}")
+        return None
 
-        chave = parts[2]
-        novo = parts[3]
-        ok = set_license_status_in_sheet(chave, novo)
-        if ok:
-            send_telegram(chat_id, f"✅ Status atualizado: {chave} -> {novo}")
+def _save_credentials(creds: Credentials):
+    data = {
+        "token": creds.token,
+        "refresh_token": creds.refresh_token,
+        "token_uri": creds.token_uri,
+        "client_id": creds.client_id,
+        "client_secret": creds.client_secret,
+        "scopes": creds.scopes,
+    }
+    with open(GOOGLE_TOKEN_PATH, "w") as f:
+        json.dump(data, f)
+
+def _sheets_service() -> build:
+    creds = _credentials_from_disk()
+    if not creds:
+        raise RuntimeError("Token OAuth do Google não encontrado. Acesse /oauth/start.")
+    if creds.expired and creds.refresh_token:
+        try:
+            creds.refresh(httpx.Client())  # não é padrão; alternativa simples é refazer o fluxo se expirar
+        except Exception:
+            pass
+    return build("sheets", "v4", credentials=creds, cache_discovery=False)
+
+# ============================ Acesso ao Sheets ====================
+def sheets_upsert_license(key: str, days: int, email: Optional[str]) -> Tuple[bool, str]:
+    """
+    Cria/atualiza a linha da licença no intervalo A:F.
+    Colunas: Licença | Validade | Data de inicio | Data final | email | status
+    """
+    service = _sheets_service()
+    sheet = service.spreadsheets()
+
+    start_dt = _now_tz()
+    end_dt = start_dt + timedelta(days=days)
+    values = [key, str(days), _fmt_date(start_dt), _fmt_date(end_dt), (email or ""), "active"]
+
+    try:
+        # Ler todas as linhas existentes
+        resp = sheet.values().get(spreadsheetId=LICENSE_SHEET_ID, range=LICENSE_SHEET_RANGE).execute()
+        rows: List[List[str]] = resp.get("values", [])
+
+        # Cabeçalho esperado (opcional; se você tem header na primeira linha, pule-a)
+        # Vamos procurar pela coluna A (Licença)
+        found_row_idx = None
+        for idx, row in enumerate(rows, start=1):
+            if len(row) >= 1 and row[0].strip().upper() == key.strip().upper():
+                found_row_idx = idx
+                break
+
+        if found_row_idx:
+            # Atualiza a linha existente
+            target_range = f"{LICENSE_SHEET_TAB}!A{found_row_idx}:F{found_row_idx}"
+            sheet.values().update(
+                spreadsheetId=LICENSE_SHEET_ID,
+                range=target_range,
+                valueInputOption="RAW",
+                body={"values": [values]},
+            ).execute()
+            return True, f"Licença *{key}* atualizada na linha {found_row_idx}."
         else:
-            send_telegram(chat_id, f"❌ Licença não encontrada: {chave}")
-        return JSONResponse({"ok": True})
+            # Append nova linha
+            sheet.values().append(
+                spreadsheetId=LICENSE_SHEET_ID,
+                range=LICENSE_SHEET_RANGE,
+                valueInputOption="RAW",
+                insertDataOption="INSERT_ROWS",
+                body={"values": [values]},
+            ).execute()
+            return True, f"Licença *{key}* criada."
+    except HttpError as e:
+        log.exception("Erro Sheets")
+        return False, f"Erro no Google Sheets: {e}"
+    except Exception as e:
+        log.exception("Erro geral Sheets")
+        return False, f"Erro ao gravar na planilha: {e}"
 
-    # info
-    if text.lower().startswith("/licenca info"):
-        parts = text.split()
-        if len(parts) < 3:
-            send_telegram(chat_id, "Uso: /licenca info <CHAVE>")
-            return JSONResponse({"ok": True})
-        chave = parts[2]
-        info = get_license_info_from_sheet(chave)
-        if not info:
-            send_telegram(chat_id, f"❌ Licença não encontrada: {chave}")
-        else:
-            msg = (
-                f"*Licença:* `{info['license_key']}`\n"
-                f"*Validade:* {info['validade']}\n"
-                f"*Início:* {info['data_inicio']}\n"
-                f"*Final:* {info['data_final']}\n"
-                f"*Email:* {info['email']}\n"
-                f"*Status:* {info['status']}"
-            )
-            send_telegram(chat_id, msg)
-        return JSONResponse({"ok": True})
-
-    # fallback
-    send_telegram(chat_id, "Comando não reconhecido. Use /start")
-    return JSONResponse({"ok": True})
-
-# health
+# ============================ Rotas HTTP ==========================
 @app.get("/ping")
 def ping():
-    return {"pong": True, "time": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+    return {"pong": True, "time": _fmt_date(_now_tz())}
+
+@app.get("/oauth/start")
+def oauth_start():
+    if not all([GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET, GOOGLE_OAUTH_REDIRECT_URI]):
+        return PlainTextResponse("Vars do OAuth ausentes.", status_code=500)
+    flow = _flow()
+    auth_url, state = flow.authorization_url(
+        access_type="offline",
+        include_granted_scopes="true",
+        prompt="consent",
+    )
+    # (Opcional) guardar state em storage; aqui pulamos
+    return RedirectResponse(auth_url)
+
+@app.get("/oauth/callback")
+def oauth_callback(request: Request):
+    flow = _flow()
+    flow.fetch_token(authorization_response=str(request.url))
+    creds = flow.credentials
+    _save_credentials(creds)
+    return PlainTextResponse(f"✅ Google OAuth concluído. Token salvo em {GOOGLE_TOKEN_PATH}")
+
+@app.get("/oauth/status")
+def oauth_status():
+    try:
+        with open(GOOGLE_TOKEN_PATH) as f:
+            data = json.load(f)
+        ok = "refresh_token" in data and data.get("token_uri")
+        return {"exists": True, "ok": bool(ok), "scopes": data.get("scopes")}
+    except Exception:
+        return {"exists": False}
+
+# ============================ Telegram Webhook ====================
+@app.post("/telegram/webhook")
+async def telegram_webhook(
+    request: Request,
+    x_telegram_bot_api_secret_token: Optional[str] = Header(default=None)
+):
+    # (opcional) valida segredo do webhook
+    if TELEGRAM_WEBHOOK_SECRET:
+        if (x_telegram_bot_api_secret_token or "").strip() != TELEGRAM_WEBHOOK_SECRET:
+            return JSONResponse({"ok": True})  # ignora silenciosamente
+
+    body = await request.json()
+    message = body.get("message") or {}
+    chat_id = message.get("chat", {}).get("id")
+    text = (message.get("text") or "").strip()
+
+    if not chat_id or not text:
+        return {"ok": True}
+
+    norm = text.lower()
+    # === /start
+    if norm == "/start":
+        await tg_send(chat_id,
+            "Olá! 👋\n"
+            "Este bot usa Google OAuth. Para configurar o Google Sheets:\n"
+            "1) Acesse *SEU_DOMÍNIO*/oauth/start, autorize e salve o token.\n"
+            "2) Depois, use /whoami ou /licenca."
+        )
+        return {"ok": True}
+
+    # === /whoami
+    if norm.startswith("/whoami"):
+        await tg_send(chat_id,
+            f"*whoami*\n• chatid: `{chat_id}`\n• admin: {'true' if _is_admin(chat_id) else 'false'}"
+        )
+        return {"ok": True}
+
+    # === /licenca nova <dias> [email]
+    if norm.startswith("/licenca") and "nova" in norm:
+        if not _is_admin(chat_id):
+            await tg_send(chat_id, "❌ Você não é admin.")
+            return {"ok": True}
+
+        parts = text.split()
+        # formatos aceitos:
+        # /licenca nova 30
+        # /licenca nova 30 email@dominio.com
+        days = None
+        email = None
+        for p in parts[2:]:
+            if p.isdigit():
+                days = int(p)
+            elif "@" in p and "." in p:
+                email = p
+
+        if not days:
+            await tg_send(chat_id, "Use: `/licenca nova <dias> [email]`")
+            return {"ok": True}
+
+        # Gera key e atualiza Sheets
+        key = _gen_license()
+        try:
+            ok, msg = sheets_upsert_license(key, days, email)
+            if ok:
+                await tg_send(chat_id,
+                    "🔑 *Licença criada/atualizada*\n"
+                    f"*Chave:* `{key}`\n"
+                    f"*Validade (dias):* {days}\n"
+                    f"*Email:* {email or '-'}\n\n{msg}"
+                )
+            else:
+                await tg_send(chat_id, f"❌ Erro ao criar licença: {msg}")
+        except Exception as e:
+            await tg_send(chat_id, f"❌ Erro ao criar licença: {e}")
+        return {"ok": True}
+
+    # Fallback
+    await tg_send(chat_id, "❗ Comando não reconhecido.")
+    return {"ok": True}
