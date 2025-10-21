@@ -413,7 +413,7 @@ def sheets_append_row(spreadsheet_id: str, sheet_name: str, values: List):
         spreadsheetId=spreadsheet_id,
         range=rng,
         valueInputOption="USER_ENTERED",
-        insertDataOption="OVERWRITE",  # não insere linha; escreve na próxima vazia da faixa
+        insertDataOption="OVERWRITE",
         body=body
     ).execute()
 
@@ -502,7 +502,6 @@ def sheet_get_license(license_key: str) -> Optional[dict]:
             end    = (r[idx["data final"]] if idx["data final"] < len(r) else "").strip()
             expires_at = None
             if end:
-                # 'YYYY-MM-DD' -> 'YYYY-MM-DDT23:59:59+00:00'
                 expires_at = f"{end}T23:59:59+00:00"
             return {
                 "license_key": license_key,
@@ -531,7 +530,7 @@ def sheet_append_license(license_key: str, days: Optional[int], email: Optional[
     sheets.spreadsheets().values().append(
         spreadsheetId=LICENSE_SHEET_ID,
         range=rng,
-        valueInputOption="USER_ENTERED",
+        valueInputOption="USER_INPUT",
         insertDataOption="INSERT_ROWS",
         body={"values": values},
     ).execute()
@@ -598,10 +597,8 @@ ASSINATURAS = {
     "youtube premium": ("ASSINATURA", "YouTube Premium"),
 }
 
-KEYWORDS_GANHOS = {"salário": "salário", "salario": "salário", "vendas": "Vendas"}
-
 def _titlecase(s: str) -> str:
-    return " ".join(w.capitalize() for w in s.split())
+    return " ".join(w.capitalize() for w in (s or "").split())
 
 def _format_date_br(d: date) -> str:
     return d.strftime("%d/%m/%Y")
@@ -612,7 +609,6 @@ def parse_date(text: str) -> Optional[str]:
     if "hoje" in t: return _format_date_br(today)
     if "ontem" in t: return _format_date_br(today - timedelta(days=1))
     if "amanh" in t: return _format_date_br(today + timedelta(days=1))
-    # dd/mm[/aaaa], dd-mm[-aaaa], dd.mm[.aaaa]
     m = re.search(r"\b(\d{1,2})[\/\-.](\d{1,2})(?:[\/\-.](\d{2,4}))?\b", t)
     if m:
         d = int(m.group(1)); mo = int(m.group(2))
@@ -625,20 +621,26 @@ def parse_date(text: str) -> Optional[str]:
     return None
 
 def parse_money(text: str) -> Optional[float]:
-    t = text.lower().replace("r$", " ").replace("reais", " ")
-    m = re.search(r"(-?\s*)?(\d{1,3}(?:[\.\s]\d{3})*(?:,\d{1,2})|\d+(?:[.,]\d{1,2})?)", t)
-    if not m:
+    t = text.lower()
+    t = t.replace("r$", " ").replace("reais", " ")
+
+    # remove datas para não capturar "01" de "01/10"
+    t = re.sub(r"\b\d{1,2}[\/\-.]\d{1,2}(?:[\/\-.]\d{2,4})?\b", " ", t)
+
+    # captura todos os números plausíveis; escolhe o último (normalmente o valor monetário)
+    pattern = re.compile(r"\b\d{1,3}(?:[.\s]\d{3})*(?:,\d{1,2})\b|\b\d+(?:[.,]\d{1,2})\b|\b\d+\b")
+    matches = list(pattern.finditer(t))
+    if not matches:
         return None
-    raw = m.group(2).replace(" ", "")
+
+    raw = matches[-1].group(0)
+    raw = raw.replace(" ", "")
     if "," in raw and "." in raw:
         raw = raw.replace(".", "").replace(",", ".")
     else:
         raw = raw.replace(",", ".")
     try:
-        val = float(raw)
-        if m.group(1) and "-" in m.group(1):
-            val = -abs(val)
-        return val
+        return float(raw)
     except:
         return None
 
@@ -673,6 +675,19 @@ def detect_payment(text: str) -> str:
     if "crédito" in t or "credito" in t: return "Crédito"
     return "Outros"
 
+def _strip_spaces(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip()
+
+def _extract_colon_category(text: str) -> Optional[str]:
+    """
+    Captura o trecho entre ':' e a próxima ',' (ou fim da string).
+    Remove espaços imediatamente após ':'.
+    """
+    m = re.search(r":\s*([^,]+)", text)
+    if m:
+        return _strip_spaces(m.group(1))
+    return None
+
 def _extract_free_text_after_keywords(text: str, keywords: List[str]) -> Optional[str]:
     """
     Extrai um trecho descritivo após palavras como 'reservei', 'resgatei', etc.
@@ -682,41 +697,38 @@ def _extract_free_text_after_keywords(text: str, keywords: List[str]) -> Optiona
         i = t.lower().find(kw)
         if i >= 0:
             frag = t[i+len(kw):].strip(" .,:;-")
-            # corta em conectores comuns
-            frag = re.split(r"\b(via|no|na|em|de|do|da)\b", frag, maxsplit=1)[0].strip()
+            frag = re.split(r"\b(via|no|na|em|de|do|da|valor|no valor)\b", frag, maxsplit=1)[0].strip()
             if frag:
                 return frag
     return None
 
 def _detect_pagamento_fatura(text: str):
+    """
+    Regra: se houver ':', categoria é o trecho entre ':' e a próxima ','.
+    Ex.: "paguei a fatura do meu: Cartão Bradesco, 2100 via pix" -> categoria = "Cartão Bradesco"
+    Senão, tenta extrair com regex tradicional.
+    """
+    cat_from_colon = _extract_colon_category(text)
+    if cat_from_colon:
+        return GROUP_EMOJI["PAG_FATURA"], cat_from_colon
+
     t = text.lower()
     m = re.search(r"fatura\s+do?\s*cart[aã]o\s+([a-z0-9 ]+)", t)
     if m:
         brand = _clean_trailing_tokens(m.group(1))
-        brand = _titlecase(brand) if brand else "Cartão"
+        brand = _titlecase(brand) if brand else "cartão"
         return GROUP_EMOJI["PAG_FATURA"], f"cartão {brand}"
-    if "paguei a fatura" in t or "pagamento da fatura" in t:
+    if "paguei a fatura" in t or "pagamento da fatura" in t or "pagamento de fatura" in t:
         return GROUP_EMOJI["PAG_FATURA"], "cartão"
     return None, None
 
 def _detect_saque_resgate(text: str):
     t = text.lower()
-    if any(w in t for w in ["saquei", "saque " , "resgatei", "resgate "]):
-        # tenta pegar o alvo: "meu investimento em Renda fixa", "Reserva de emergência"
-        np = _extract_free_text_after_keywords(text, ["saquei", "resgatei", "saque", "resgate"])
-        if np:
-            np = np.strip()
-            # normaliza capitalização leve (mantendo preposições minúsculas)
-            words = np.split()
-            pretty = []
-            for w in words:
-                if w.lower() in {"de", "da", "do", "em", "no", "na", "pra", "para", "del"}:
-                    pretty.append(w.lower())
-                else:
-                    pretty.append(w[:1].upper() + w[1:])
-            cat = " ".join(pretty)
-        else:
-            cat = "Saque/Resgate"
+    if any(w in t for w in ["saquei", "saque ", "resgatei", "resgate "]):
+        cat = _extract_colon_category(text)
+        if not cat:
+            np = _extract_free_text_after_keywords(text, ["saquei", "resgatei", "saque", "resgate"])
+            cat = np if np else "Saque/Resgate"
         return GROUP_EMOJI["SAQUE_RESGATE"], cat
     return None, None
 
@@ -736,45 +748,46 @@ def detect_group_and_category(text: str) -> Tuple[str, str]:
         if k in t:
             return GROUP_EMOJI[gkey], cat_disp
 
-    # Ganhos
-    for k, cdisp in KEYWORDS_GANHOS.items():
-        if k in t or re.search(r"\b(recebi|ganhei)\b", t):
-            return GROUP_EMOJI["GANHOS"], cdisp
+    # Ganhos (prioriza "vendas")
+    if "vendas" in t:
+        return GROUP_EMOJI["GANHOS"], "Vendas"
+    if "salário" in t or "salario" in t:
+        return GROUP_EMOJI["GANHOS"], "salário"
+    if re.search(r"\b(recebi|ganhei)\b", t):
+        return GROUP_EMOJI["GANHOS"], "Ganhos"
 
     # Investimentos
     if any(w in t for w in ["investi", "investimento", "ações", "acoes", "renda fixa"]):
-        # Categoria
         if "renda fixa" in t:
             categoria = "renda fixa"
-        elif "aç" in t or "aco" in t:
+        elif "aç" in t or "aco" in t or "ações" in t or "acoes" in t:
             categoria = "Ações"
         else:
-            # tenta extrair após "em"
             m = re.search(r"\binv\w*\s+(?:em\s+)?([a-z0-9 ]+)", t)
             categoria = _titlecase(_clean_trailing_tokens(m.group(1))) if m else "Investimento"
         return GROUP_EMOJI["INVESTIMENTO"], categoria
 
-    # Reserva (destinação de dinheiro)
+    # Reserva
     if any(w in t for w in ["reservei", "reserva "]) or re.search(r"\breservei\b|\breserva\b", t):
-        np = _extract_free_text_after_keywords(text, ["reservei", "reserva"])
-        categoria = np if np else "Reserva"
-        return GROUP_EMOJI["RESERVA"], categoria
+        cat2 = _extract_colon_category(text)
+        if not cat2:
+            cat2 = _extract_free_text_after_keywords(text, ["reservei", "reserva"]) or "Reserva"
+        return GROUP_EMOJI["RESERVA"], cat2
 
-    # Fixos primeiro (aluguel, água, energia...)
+    # Fixos
     for k, (gkey, cat_disp) in KEYWORDS_FIXOS.items():
         if k in t:
             return GROUP_EMOJI[gkey], cat_disp
 
-    # Variáveis (lojas/apps/mercado etc.)
+    # Variáveis (mapeadas)
     for k, (gkey, cat_disp) in MERCHANT_MAP.items():
         if k in t:
             return GROUP_EMOJI[gkey], cat_disp
 
-    # fallback por palavras-chave gerais
+    # fallback geral
     if any(w in t for w in ["mercado", "restaurante", "lanche", "pizza", "hamburg", "sushi", "ifood", "rappi"]):
         return GROUP_EMOJI["GASTOS_VARIAVEIS"], "mercado" if "mercado" in t else "Outros"
 
-    # default
     return GROUP_EMOJI["GASTOS_VARIAVEIS"], "Outros"
 
 def parse_natural(text: str) -> Tuple[Optional[List], Optional[str]]:
@@ -790,30 +803,20 @@ def parse_natural(text: str) -> Tuple[Optional[List], Optional[str]]:
     t_low = text.lower()
 
     # Tipo:
-    # - Saque/Resgate e Ganhos => Entrada
-    # - Pagamento de fatura => Entrada (conforme expectativa)
-    if group in (GROUP_EMOJI["SAQUE_RESGATE"], GROUP_EMOJI["GANHOS"], GROUP_EMOJI["PAG_FATURA"]) \
-       or re.search(r"\b(ganhei|recebi|sal[aá]rio|renda)\b", t_low):
+    # - Saque/Resgate, Ganhos, Pagamento de fatura => Entrada
+    # - Investimento => sempre Saída
+    if group == GROUP_EMOJI["INVESTIMENTO"]:
+        tipo = "▼ Saída"
+    elif group in (GROUP_EMOJI["SAQUE_RESGATE"], GROUP_EMOJI["GANHOS"], GROUP_EMOJI["PAG_FATURA"]) \
+         or re.search(r"\b(ganhei|recebi|sal[aá]rio|renda)\b", t_low):
         tipo = "▲ Entrada"
     else:
         tipo = "▼ Saída"
 
-    # Descrição curta (mantém seu comportamento; aqui pouco usado nos seus testes)
-    desc = None
-    m = re.search(r"(comprei|paguei|gastei|investi|resgatei|saquei)\s+(.*?)(?:\s+na\s+|\s+no\s+|\s+via\s+|$)", t_low)
-    if m:
-        raw = m.group(2)
-        raw = re.sub(r"\d{1,3}(?:\.\d{3})*(?:,\d{2})|\d+(?:\.\d{2})?", "", raw)
-        raw = re.sub(r"\b(hoje|ontem|\d{1,2}[\/\-.]\d{1,2}(?:[\/\-.]\d{2,4})?)\b", "", raw)
-        raw = raw.strip(" .,-")
-        if raw and len(raw) < 60:
-            desc = _titlecase(raw)
+    # Descrição: sempre vazia
+    desc = ""
 
-    # Pagamento de fatura: descrição vazia
-    if group == GROUP_EMOJI["PAG_FATURA"]:
-        desc = ""
-
-    return [data_br, tipo, group, category, (desc or ""), float(valor), forma, cond], None
+    return [data_br, tipo, group, category, desc, float(valor), forma, cond], None
 
 # ===========================
 # Provisionamento (Google)
