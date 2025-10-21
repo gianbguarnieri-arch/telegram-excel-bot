@@ -5,8 +5,8 @@ import sqlite3
 import secrets
 import string
 import logging
-import unicodedata  # NEW
-from datetime import datetime, timedelta, timezone
+import unicodedata
+from datetime import datetime, timedelta, timezone, date
 from typing import Optional, Tuple, List
 
 import httpx
@@ -139,27 +139,21 @@ def _gen_key(prefix="GF"):
 
 # ======== create_license usa Sheets se disponível =========
 def create_license(days: Optional[int] = 30, max_files: int = 1, notes: Optional[str] = None, custom_key: Optional[str] = None):
-    """
-    Se LICENSE_SHEET_ID estiver definido → cria/append na planilha.
-    Caso contrário, mantém o comportamento anterior (SQLite).
-    """
     key = custom_key or _gen_key()
 
     if LICENSE_SHEET_ID:
-        # evita colisão improvável
         if _sheet_find_row_idx_by_license(key):
             while _sheet_find_row_idx_by_license(key):
                 key = _gen_key()
 
         sheet_append_license(key, None if days == 0 else days, email=None)
 
-        # valor exibido ao admin: iso data final ou 'vitalícia'
         exp = None
         if days and days > 0:
             exp = (datetime.now(timezone.utc) + timedelta(days=days)).date().strftime("%Y-%m-%d")
         return key, exp
 
-    # --- fallback SQLite (como antes) ---
+    # fallback SQLite
     expires_at = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat(timespec="seconds") if days else None
     con = _db()
     con.execute("INSERT INTO licenses(license_key,status,max_files,expires_at,notes) VALUES(?,?,?,?,?)",
@@ -169,14 +163,10 @@ def create_license(days: Optional[int] = 30, max_files: int = 1, notes: Optional
 
 # ======== get_license lê do Sheets se disponível =========
 def get_license(license_key: str):
-    """
-    Se LICENSE_SHEET_ID estiver definido → lê da planilha.
-    Caso contrário, mantém o comportamento anterior (SQLite).
-    """
     if LICENSE_SHEET_ID:
         return sheet_get_license(license_key)
 
-    # --- fallback SQLite ---
+    # fallback SQLite
     con = _db()
     cur = con.execute("SELECT license_key,status,max_files,expires_at,notes FROM licenses WHERE license_key=?",
                       (license_key,))
@@ -431,10 +421,6 @@ def sheets_append_row(spreadsheet_id: str, sheet_name: str, values: List):
 # ======= Licenças em Google Sheets
 # ===========================
 def _sheet_get_headers_and_rows():
-    """
-    Lê cabeçalho (linha 1) e todas as linhas seguintes da aba de licenças.
-    Requer LICENSE_SHEET_ID configurado.
-    """
     if not LICENSE_SHEET_ID:
         raise RuntimeError("LICENSE_SHEET_ID não configurado.")
 
@@ -450,16 +436,17 @@ def _sheet_get_headers_and_rows():
     rows = values[1:]
     return headers, rows
 
+def _norm(s: str) -> str:
+    s = unicodedata.normalize("NFD", s or "")
+    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+    return s.strip().lower()
+
 def _sheet_header_index_map(headers):
     """
-    Aceita estes nomes (case/acento ignorados):
-      Licença | Validade | Data de inicio | Data final | email | status
+    Aceita: Licença | Validade | Data de inicio | Data final | email | status
+    (case/acentos/ç ignorados)
     """
-    def norm(s: str) -> str:
-        s = unicodedata.normalize("NFD", s or "")
-        s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")  # remove acentos/ç
-        return s.strip().lower()
-    idx = {norm(h): i for i, h in enumerate(headers)}
+    idx = {_norm(h): i for i, h in enumerate(headers)}
     required = ["licenca", "validade", "data de inicio", "data final", "email", "status"]
     missing = [r for r in required if r not in idx]
     if missing:
@@ -476,7 +463,6 @@ def _sheet_find_row_idx_by_license(license_key: str) -> Optional[int]:
     return None
 
 def _col_letter(col_zero_based: int) -> str:
-    # A..Z suficiente aqui (A-F), mas deixo generalizado
     col = col_zero_based + 1
     letters = ""
     while col:
@@ -485,12 +471,8 @@ def _col_letter(col_zero_based: int) -> str:
     return letters
 
 def sheet_update_license_email(license_key: str, email: str):
-    """
-    Atualiza a célula da coluna 'email' na linha da licença informada.
-    """
     if not LICENSE_SHEET_ID:
-        return  # nada a fazer se não usa planilha de licenças
-
+        return
     row = _sheet_find_row_idx_by_license(license_key)
     if not row:
         raise RuntimeError(f"Licença '{license_key}' não encontrada na planilha de licenças.")
@@ -510,11 +492,6 @@ def sheet_update_license_email(license_key: str, email: str):
     ).execute()
 
 def sheet_get_license(license_key: str) -> Optional[dict]:
-    """
-    Retorna no formato esperado por is_license_valid():
-      { license_key, status, max_files, expires_at, notes }
-    Onde expires_at é ISO datetime com TZ (ex.: '2025-11-19T23:59:59+00:00') ou None.
-    """
     headers, rows = _sheet_get_headers_and_rows()
     idx = _sheet_header_index_map(headers)
 
@@ -525,21 +502,18 @@ def sheet_get_license(license_key: str) -> Optional[dict]:
             end    = (r[idx["data final"]] if idx["data final"] < len(r) else "").strip()
             expires_at = None
             if end:
-                # transforma 'YYYY-MM-DD' em 'YYYY-MM-DDT23:59:59+00:00'
+                # 'YYYY-MM-DD' -> 'YYYY-MM-DDT23:59:59+00:00'
                 expires_at = f"{end}T23:59:59+00:00"
             return {
                 "license_key": license_key,
                 "status": status,
-                "max_files": 1,   # planilha não controla isso por enquanto
+                "max_files": 1,
                 "expires_at": expires_at,
                 "notes": None,
             }
     return None
 
 def sheet_append_license(license_key: str, days: Optional[int], email: Optional[str] = None):
-    """
-    Insere nova linha: Licença | Validade(dias) | Data de inicio | Data final | email | status
-    """
     start_date = datetime.now(timezone.utc).date()
     start_iso = start_date.strftime("%Y-%m-%d")
     end_iso   = (start_date + timedelta(days=days)).strftime("%Y-%m-%d") if days else ""
@@ -565,40 +539,18 @@ def sheet_append_license(license_key: str, days: Optional[int], email: Optional[
 # ===========================
 # NLP / Parsing
 # ===========================
-def parse_money(text: str) -> Optional[float]:
-    m = re.search(r"(\d{1,3}(?:\.\d{3})*(?:,\d{2})|\d+(?:\.\d{2})?)", text)
-    if not m: return None
-    val = m.group(1).replace(".", "").replace(",", ".")
-    try:
-        return float(val)
-    except:
-        return None
 
-def parse_date(text: str) -> Optional[str]:
-    t = text.lower()
-    today = datetime.now().date()
-    if "hoje" in t: return today.strftime("%Y-%m-%d")
-    if "ontem" in t: return (today - timedelta(days=1)).strftime("%Y-%m-%d")
-    m = re.search(r"\b(\d{1,2})/(\d{1,2})(?:/(\d{4}))?\b", text)
-    if m:
-        d, mo, y = m.group(1), m.group(2), m.group(3) or str(today.year)
-        try:
-            dt = datetime.strptime(f"{d}/{mo}/{y}", "%d/%m/%Y").date()
-            return dt.strftime("%Y-%m-%d")
-        except: return None
-    return None
-
-# ===== Grupos com ícones =====
+# --- Etiquetas de grupos (sem espaço após o emoji) ---
 GROUP_EMOJI = {
-    "GASTOS_FIXOS":      "🏠 Gastos Fixos",
-    "ASSINATURA":        "📺 Assinatura",
-    "GASTOS_VARIAVEIS":  "💸 Gastos Variáveis",
-    "DESPESAS_TEMP":     "🧾 Despesas Temporárias",
-    "PAG_FATURA":        "💳 Pagamento de Fatura",
-    "GANHOS":            "💵 Ganhos",
-    "INVESTIMENTO":      "💰 Investimento",
-    "RESERVA":           "📝 Reserva",
-    "SAQUE_RESGATE":     "💲 Saque/Resgate",
+    "GASTOS_FIXOS":      "🏠Gastos Fixos",
+    "ASSINATURA":        "📺Assinatura",
+    "GASTOS_VARIAVEIS":  "💸Gastos Variáveis",
+    "DESPESAS_TEMP":     "🧾Despesas Temporárias",
+    "PAG_FATURA":        "💳Pagamento de Fatura",
+    "GANHOS":            "💵Ganhos",
+    "INVESTIMENTO":      "💰Investimento",
+    "RESERVA":           "📝Reserva",
+    "SAQUE_RESGATE":     "💲Saque/Resgate",
 }
 
 TRAILING_STOP = {
@@ -607,33 +559,104 @@ TRAILING_STOP = {
     "pix", "débito", "debito", "crédito", "credito"
 }
 
-ASSINATURAS = {
-    "netflix": "Netflix",
-    "spotify": "Spotify",
-    "disney": "Disney+",
-    "amazon prime": "Amazon Prime",
-    "prime video": "Amazon Prime",
-    "globoplay": "Globoplay",
-    "hbo": "HBO",
-    "max": "Max",
-    "apple tv": "Apple TV+",
-    "youtube premium": "YouTube Premium",
+# mapeamentos úteis para categoria/grupo
+MERCHANT_MAP = {
+    "ifood": ("GASTOS_VARIAVEIS", "ifood"),
+    "uber": ("GASTOS_VARIAVEIS", "Uber"),
+    "99": ("GASTOS_VARIAVEIS", "99"),
+    "rappi": ("GASTOS_VARIAVEIS", "Rappi"),
+    "magazine luiza": ("GASTOS_VARIAVEIS", "Magazine Luiza"),
+    "magalu": ("GASTOS_VARIAVEIS", "Magazine Luiza"),
+    "amazon": ("GASTOS_VARIAVEIS", "Amazon"),
+    "mercado livre": ("GASTOS_VARIAVEIS", "Mercado Livre"),
+    "mercado": ("GASTOS_VARIAVEIS", "mercado"),
 }
 
-KEYWORDS_FIXOS = {"aluguel", "condomínio", "condominio", "luz", "energia", "água", "agua", "internet"}
-KEYWORDS_TEMP = {"iptu", "ipva", "multa", "empréstimo", "emprestimo"}
-KEYWORDS_VARIAVEIS = {"mercado", "farmácia", "farmacia", "combustível", "combustivel", "restaurante", "lanche",
-                      "pizza", "hamburguer", "sushi", "ifood", "cinema", "passeio", "hotel", "viagem"}
-KEYWORDS_GANHOS = {"salário", "salario", "recebi", "ganhei", "renda", "pró labore", "pro labore"}
+KEYWORDS_FIXOS = {
+    "aluguel": ("GASTOS_FIXOS", "aluguel"),
+    "água": ("GASTOS_FIXOS", "Agua"),
+    "agua": ("GASTOS_FIXOS", "Agua"),
+    "energia": ("GASTOS_FIXOS", "Energia"),
+    "luz": ("GASTOS_FIXOS", "Energia"),
+    "internet": ("GASTOS_FIXOS", "Internet"),
+    "condomínio": ("GASTOS_FIXOS", "Condomínio"),
+    "condominio": ("GASTOS_FIXOS", "Condomínio"),
+}
+
+ASSINATURAS = {
+    "netflix": ("ASSINATURA", "Netflix"),
+    "amazon": ("ASSINATURA", "Amazon"),
+    "amazon prime": ("ASSINATURA", "Amazon"),
+    "prime video": ("ASSINATURA", "Amazon"),
+    "disney": ("ASSINATURA", "Disney+"),
+    "disney+": ("ASSINATURA", "Disney+"),
+    "globoplay": ("ASSINATURA", "Globoplay"),
+    "spotify": ("ASSINATURA", "Spotify"),
+    "hbo": ("ASSINATURA", "HBO"),
+    "max": ("ASSINATURA", "Max"),
+    "apple tv": ("ASSINATURA", "Apple TV+"),
+    "youtube premium": ("ASSINATURA", "YouTube Premium"),
+}
+
+KEYWORDS_GANHOS = {"salário": "salário", "salario": "salário", "vendas": "Vendas"}
 
 def _titlecase(s: str) -> str:
     return " ".join(w.capitalize() for w in s.split())
+
+def _format_date_br(d: date) -> str:
+    return d.strftime("%d/%m/%Y")
+
+def parse_date(text: str) -> Optional[str]:
+    t = text.lower()
+    today = datetime.now().date()
+    if "hoje" in t: return _format_date_br(today)
+    if "ontem" in t: return _format_date_br(today - timedelta(days=1))
+    if "amanh" in t: return _format_date_br(today + timedelta(days=1))
+    # dd/mm[/aaaa], dd-mm[-aaaa], dd.mm[.aaaa]
+    m = re.search(r"\b(\d{1,2})[\/\-.](\d{1,2})(?:[\/\-.](\d{2,4}))?\b", t)
+    if m:
+        d = int(m.group(1)); mo = int(m.group(2))
+        y = int(m.group(3)) if m.group(3) else today.year
+        if y < 100: y += 2000
+        try:
+            return _format_date_br(datetime(y, mo, d).date())
+        except:
+            return None
+    return None
+
+def parse_money(text: str) -> Optional[float]:
+    t = text.lower().replace("r$", " ").replace("reais", " ")
+    m = re.search(r"(-?\s*)?(\d{1,3}(?:[\.\s]\d{3})*(?:,\d{1,2})|\d+(?:[.,]\d{1,2})?)", t)
+    if not m:
+        return None
+    raw = m.group(2).replace(" ", "")
+    if "," in raw and "." in raw:
+        raw = raw.replace(".", "").replace(",", ".")
+    else:
+        raw = raw.replace(",", ".")
+    try:
+        val = float(raw)
+        if m.group(1) and "-" in m.group(1):
+            val = -abs(val)
+        return val
+    except:
+        return None
 
 def _clean_trailing_tokens(s: str) -> str:
     tokens = s.split()
     while tokens and tokens[-1].lower() in TRAILING_STOP:
         tokens.pop()
     return " ".join(tokens).strip()
+
+def detect_installments(text: str) -> str:
+    t = text.lower()
+    m = re.search(r"(\d{1,2})\s*x", t)
+    if m: return f"{m.group(1)}x"
+    m = re.search(r"(\d{1,2})\s*de\s*(\d{1,2})", t)
+    if m: return f"{m.group(2)}x"
+    if "parcelad" in t: return "parcelado"
+    if "à vista" in t or "a vista" in t or "avista" in t: return "à vista"
+    return "à vista"
 
 def detect_payment(text: str) -> str:
     t = text.lower()
@@ -642,120 +665,155 @@ def detect_payment(text: str) -> str:
         brand = _clean_trailing_tokens(m.group(1))
         brand = re.sub(r"\s+", " ", brand).strip()
         if brand:
-            return f"💳 cartão {_titlecase(brand)}"
-        return "💳 cartão"
+            return f"💳cartão {_titlecase(brand)}"
+        return "💳cartão"
     if "pix" in t: return "Pix"
     if "dinheiro" in t or "cash" in t: return "Dinheiro"
-    if "débito" in t or "debito" in t: return "Débito"
+    if "débito" in t or "debito" in t: return "débito"
     if "crédito" in t or "credito" in t: return "Crédito"
     return "Outros"
 
+def _extract_free_text_after_keywords(text: str, keywords: List[str]) -> Optional[str]:
+    """
+    Extrai um trecho descritivo após palavras como 'reservei', 'resgatei', etc.
+    """
+    t = text.strip()
+    for kw in keywords:
+        i = t.lower().find(kw)
+        if i >= 0:
+            frag = t[i+len(kw):].strip(" .,:;-")
+            # corta em conectores comuns
+            frag = re.split(r"\b(via|no|na|em|de|do|da)\b", frag, maxsplit=1)[0].strip()
+            if frag:
+                return frag
+    return None
+
 def _detect_pagamento_fatura(text: str):
     t = text.lower()
-    m = re.search(r"pague[iu]\s+a?\s*fatura\s+do?\s+cart[aã]o\s+([a-z0-9 ]+)", t)
+    m = re.search(r"fatura\s+do?\s*cart[aã]o\s+([a-z0-9 ]+)", t)
     if m:
         brand = _clean_trailing_tokens(m.group(1))
-        if brand:
-            return GROUP_EMOJI["PAG_FATURA"], f"Cartão {_titlecase(brand)}"
-        return GROUP_EMOJI["PAG_FATURA"], "Cartão"
+        brand = _titlecase(brand) if brand else "Cartão"
+        return GROUP_EMOJI["PAG_FATURA"], f"cartão {brand}"
+    if "paguei a fatura" in t or "pagamento da fatura" in t:
+        return GROUP_EMOJI["PAG_FATURA"], "cartão"
     return None, None
 
 def _detect_saque_resgate(text: str):
     t = text.lower()
-    if any(w in t for w in ["saquei", "saque", "resgatei", "resgate"]):
-        origem = None
-        m = re.search(r"(?:do|da|de)\s+([a-z0-9 ]+)", t)
-        if m:
-            origem = _clean_trailing_tokens(m.group(1))
-            origem = _titlecase(origem)
-        return GROUP_EMOJI["SAQUE_RESGATE"], (origem or "Saque/Resgate")
+    if any(w in t for w in ["saquei", "saque " , "resgatei", "resgate "]):
+        # tenta pegar o alvo: "meu investimento em Renda fixa", "Reserva de emergência"
+        np = _extract_free_text_after_keywords(text, ["saquei", "resgatei", "saque", "resgate"])
+        if np:
+            np = np.strip()
+            # normaliza capitalização leve (mantendo preposições minúsculas)
+            words = np.split()
+            pretty = []
+            for w in words:
+                if w.lower() in {"de", "da", "do", "em", "no", "na", "pra", "para", "del"}:
+                    pretty.append(w.lower())
+                else:
+                    pretty.append(w[:1].upper() + w[1:])
+            cat = " ".join(pretty)
+        else:
+            cat = "Saque/Resgate"
+        return GROUP_EMOJI["SAQUE_RESGATE"], cat
     return None, None
 
 def detect_group_and_category(text: str) -> Tuple[str, str]:
     t = text.lower()
 
+    # Pagamento de fatura (antes de tudo)
     grp, cat = _detect_pagamento_fatura(text)
     if grp: return grp, cat
 
+    # Saque/Resgate
     grp, cat = _detect_saque_resgate(text)
     if grp: return grp, cat
 
-    for k, display in ASSINATURAS.items():
+    # Assinaturas
+    for k, (gkey, cat_disp) in ASSINATURAS.items():
         if k in t:
-            return GROUP_EMOJI["ASSINATURA"], display
+            return GROUP_EMOJI[gkey], cat_disp
 
-    if any(w in t for w in KEYWORDS_GANHOS):
-        return GROUP_EMOJI["GANHOS"], "Ganhos"
+    # Ganhos
+    for k, cdisp in KEYWORDS_GANHOS.items():
+        if k in t or re.search(r"\b(recebi|ganhei)\b", t):
+            return GROUP_EMOJI["GANHOS"], cdisp
 
-    if any(w in t for w in KEYWORDS_FIXOS):
-        for w in KEYWORDS_FIXOS:
-            if w in t:
-                return GROUP_EMOJI["GASTOS_FIXOS"], _titlecase(w)
-        return GROUP_EMOJI["GASTOS_FIXOS"], "Gasto Fixo"
+    # Investimentos
+    if any(w in t for w in ["investi", "investimento", "ações", "acoes", "renda fixa"]):
+        # Categoria
+        if "renda fixa" in t:
+            categoria = "renda fixa"
+        elif "aç" in t or "aco" in t:
+            categoria = "Ações"
+        else:
+            # tenta extrair após "em"
+            m = re.search(r"\binv\w*\s+(?:em\s+)?([a-z0-9 ]+)", t)
+            categoria = _titlecase(_clean_trailing_tokens(m.group(1))) if m else "Investimento"
+        return GROUP_EMOJI["INVESTIMENTO"], categoria
 
-    if any(w in t for w in KEYWORDS_TEMP):
-        for w in KEYWORDS_TEMP:
-            if w in t:
-                return GROUP_EMOJI["DESPESAS_TEMP"], _titlecase(w)
-        return GROUP_EMOJI["DESPESAS_TEMP"], "Despesa Temporária"
+    # Reserva (destinação de dinheiro)
+    if any(w in t for w in ["reservei", "reserva "]) or re.search(r"\breservei\b|\breserva\b", t):
+        np = _extract_free_text_after_keywords(text, ["reservei", "reserva"])
+        categoria = np if np else "Reserva"
+        return GROUP_EMOJI["RESERVA"], categoria
 
-    if any(w in t for w in KEYWORDS_VARIAVEIS):
-        for w in KEYWORDS_VARIAVEIS:
-            if w in t:
-                return GROUP_EMOJI["GASTOS_VARIAVEIS"], _titlecase(w)
-        return GROUP_EMOJI["GASTOS_VARIAVEIS"], "Gasto Variável"
+    # Fixos primeiro (aluguel, água, energia...)
+    for k, (gkey, cat_disp) in KEYWORDS_FIXOS.items():
+        if k in t:
+            return GROUP_EMOJI[gkey], cat_disp
 
-    if "aporte" in t or "investi" in t or "comprei ação" in t or "comprei acoes" in t:
-        return GROUP_EMOJI["INVESTIMENTO"], "Aporte"
-    if "reserva" in t or "meta" in t or "objetivo" in t:
-        return GROUP_EMOJI["RESERVA"], "Reserva"
+    # Variáveis (lojas/apps/mercado etc.)
+    for k, (gkey, cat_disp) in MERCHANT_MAP.items():
+        if k in t:
+            return GROUP_EMOJI[gkey], cat_disp
 
+    # fallback por palavras-chave gerais
+    if any(w in t for w in ["mercado", "restaurante", "lanche", "pizza", "hamburg", "sushi", "ifood", "rappi"]):
+        return GROUP_EMOJI["GASTOS_VARIAVEIS"], "mercado" if "mercado" in t else "Outros"
+
+    # default
     return GROUP_EMOJI["GASTOS_VARIAVEIS"], "Outros"
-
-def detect_installments(text: str) -> str:
-    t = text.lower()
-    m = re.search(r"(\d{1,2})x", t)
-    if m: return f"{m.group(1)}x"
-    if "parcelad" in t: return "parcelado"
-    if "à vista" in t or "a vista" in t or "avista" in t: return "à vista"
-    return "à vista"
 
 def parse_natural(text: str) -> Tuple[Optional[List], Optional[str]]:
     valor = parse_money(text)
     if valor is None:
         return None, "Não achei o valor. Ex.: 45,90"
 
-    data_iso = parse_date(text) or datetime.now().strftime("%Y-%m-%d")
+    data_br = parse_date(text) or _format_date_br(datetime.now().date())
     forma = detect_payment(text)
     cond = detect_installments(text)
 
     group, category = detect_group_and_category(text)
     t_low = text.lower()
 
-    # Tipo com ícones
-    if group == GROUP_EMOJI["SAQUE_RESGATE"]:
-        tipo = "▲ Entrada"
-    elif group == GROUP_EMOJI["GANHOS"] or re.search(r"\b(ganhei|recebi|sal[aá]rio|renda)\b", t_low):
+    # Tipo:
+    # - Saque/Resgate e Ganhos => Entrada
+    # - Pagamento de fatura => Entrada (conforme expectativa)
+    if group in (GROUP_EMOJI["SAQUE_RESGATE"], GROUP_EMOJI["GANHOS"], GROUP_EMOJI["PAG_FATURA"]) \
+       or re.search(r"\b(ganhei|recebi|sal[aá]rio|renda)\b", t_low):
         tipo = "▲ Entrada"
     else:
         tipo = "▼ Saída"
 
-    # Descrição curta
+    # Descrição curta (mantém seu comportamento; aqui pouco usado nos seus testes)
     desc = None
-    m = re.search(r"(comprei|paguei|gastei)\s+(.*?)(?:\s+na\s+|\s+no\s+|\s+via\s+|$)", t_low)
+    m = re.search(r"(comprei|paguei|gastei|investi|resgatei|saquei)\s+(.*?)(?:\s+na\s+|\s+no\s+|\s+via\s+|$)", t_low)
     if m:
         raw = m.group(2)
         raw = re.sub(r"\d{1,3}(?:\.\d{3})*(?:,\d{2})|\d+(?:\.\d{2})?", "", raw)
-        raw = re.sub(r"\b(hoje|ontem|\d{1,2}/\d{1,2}(?:/\d{4})?)\b", "", raw)
+        raw = re.sub(r"\b(hoje|ontem|\d{1,2}[\/\-.]\d{1,2}(?:[\/\-.]\d{2,4})?)\b", "", raw)
         raw = raw.strip(" .,-")
         if raw and len(raw) < 60:
             desc = _titlecase(raw)
 
-    # Pagamento de fatura → descrição vazia
+    # Pagamento de fatura: descrição vazia
     if group == GROUP_EMOJI["PAG_FATURA"]:
         desc = ""
 
-    return [data_iso, tipo, group, category, (desc or ""), float(valor), forma, cond], None
+    return [data_br, tipo, group, category, (desc or ""), float(valor), forma, cond], None
 
 # ===========================
 # Provisionamento (Google)
@@ -939,8 +997,6 @@ async def telegram_webhook(
             return {"ok": True}
 
         set_client_email(chat_id_str, email)
-
-        # NEW: grava o e-mail na planilha de licenças
         try:
             if LICENSE_SHEET_ID:
                 sheet_update_license_email(token, email)
@@ -982,8 +1038,6 @@ async def telegram_webhook(
             await tg_send(chat_id, "❗ E-mail inválido. Tente novamente (ex.: `cliente@gmail.com`).")
             return {"ok": True}
         set_client_email(chat_id_str, email)
-
-        # NEW: atualiza a planilha de licenças usando a licença guardada em pending.temp_license
         try:
             if LICENSE_SHEET_ID and temp_license:
                 sheet_update_license_email(temp_license, email)
