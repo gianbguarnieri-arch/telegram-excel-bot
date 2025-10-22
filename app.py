@@ -530,7 +530,7 @@ def sheet_append_license(license_key: str, days: Optional[int], email: Optional[
     sheets.spreadsheets().values().append(
         spreadsheetId=LICENSE_SHEET_ID,
         range=rng,
-        valueInputOption="USER_INPUT",
+        valueInputOption="USER_ENTERED",
         insertDataOption="INSERT_ROWS",
         body={"values": values},
     ).execute()
@@ -558,7 +558,6 @@ TRAILING_STOP = {
     "pix", "débito", "debito", "crédito", "credito"
 }
 
-# mapeamentos úteis para categoria/grupo
 MERCHANT_MAP = {
     "ifood": ("GASTOS_VARIAVEIS", "ifood"),
     "uber": ("GASTOS_VARIAVEIS", "Uber"),
@@ -702,12 +701,18 @@ def _extract_free_text_after_keywords(text: str, keywords: List[str]) -> Optiona
                 return frag
     return None
 
+def _has_fatura_keywords(t: str) -> bool:
+    t = t.lower()
+    return ("pagamento de fatura" in t) or ("paguei a fatura" in t)
+
 def _detect_pagamento_fatura(text: str):
     """
-    Regra: se houver ':', categoria é o trecho entre ':' e a próxima ','.
-    Ex.: "paguei a fatura do meu: Cartão Bradesco, 2100 via pix" -> categoria = "Cartão Bradesco"
-    Senão, tenta extrair com regex tradicional.
+    Só é Pagamento de Fatura se houver as palavras-chave ("pagamento de fatura" ou "paguei a fatura").
+    Se houver, categoria usa ":" se existir; senão tenta extrair com regex de cartão.
     """
+    if not _has_fatura_keywords(text):
+        return None, None
+
     cat_from_colon = _extract_colon_category(text)
     if cat_from_colon:
         return GROUP_EMOJI["PAG_FATURA"], cat_from_colon
@@ -718,9 +723,9 @@ def _detect_pagamento_fatura(text: str):
         brand = _clean_trailing_tokens(m.group(1))
         brand = _titlecase(brand) if brand else "cartão"
         return GROUP_EMOJI["PAG_FATURA"], f"cartão {brand}"
-    if "paguei a fatura" in t or "pagamento da fatura" in t or "pagamento de fatura" in t:
-        return GROUP_EMOJI["PAG_FATURA"], "cartão"
-    return None, None
+
+    # fallback genérico (se só disser "paguei a fatura" sem marca)
+    return GROUP_EMOJI["PAG_FATURA"], "cartão"
 
 def _detect_saque_resgate(text: str):
     t = text.lower()
@@ -735,29 +740,21 @@ def _detect_saque_resgate(text: str):
 def detect_group_and_category(text: str) -> Tuple[str, str]:
     t = text.lower()
 
-    # Pagamento de fatura (antes de tudo)
-    grp, cat = _detect_pagamento_fatura(text)
-    if grp: return grp, cat
+    # PRIORIDADE CORRETA:
 
-    # Saque/Resgate
+    # 1) Saque/Resgate
     grp, cat = _detect_saque_resgate(text)
     if grp: return grp, cat
 
-    # Assinaturas
-    for k, (gkey, cat_disp) in ASSINATURAS.items():
-        if k in t:
-            return GROUP_EMOJI[gkey], cat_disp
+    # 2) Reserva
+    if any(w in t for w in ["reservei", "reserva "]) or re.search(r"\breservei\b|\breserva\b", t):
+        cat2 = _extract_colon_category(text)
+        if not cat2:
+            cat2 = _extract_free_text_after_keywords(text, ["reservei", "reserva"]) or "Reserva"
+        return GROUP_EMOJI["RESERVA"], cat2
 
-    # Ganhos (prioriza "vendas")
-    if "vendas" in t:
-        return GROUP_EMOJI["GANHOS"], "Vendas"
-    if "salário" in t or "salario" in t:
-        return GROUP_EMOJI["GANHOS"], "salário"
-    if re.search(r"\b(recebi|ganhei)\b", t):
-        return GROUP_EMOJI["GANHOS"], "Ganhos"
-
-    # Investimentos
-    if any(w in t for w in ["investi", "investimento", "ações", "acoes", "renda fixa"]):
+    # 3) Investimento (palavras-chave solicitadas)
+    if ("investi" in t) or ("investimento" in t):
         if "renda fixa" in t:
             categoria = "renda fixa"
         elif "aç" in t or "aco" in t or "ações" in t or "acoes" in t:
@@ -767,24 +764,34 @@ def detect_group_and_category(text: str) -> Tuple[str, str]:
             categoria = _titlecase(_clean_trailing_tokens(m.group(1))) if m else "Investimento"
         return GROUP_EMOJI["INVESTIMENTO"], categoria
 
-    # Reserva
-    if any(w in t for w in ["reservei", "reserva "]) or re.search(r"\breservei\b|\breserva\b", t):
-        cat2 = _extract_colon_category(text)
-        if not cat2:
-            cat2 = _extract_free_text_after_keywords(text, ["reservei", "reserva"]) or "Reserva"
-        return GROUP_EMOJI["RESERVA"], cat2
+    # 4) Pagamento de Fatura (apenas se houver as palavras-chave)
+    grp, cat = _detect_pagamento_fatura(text)
+    if grp: return grp, cat
 
-    # Fixos
+    # 5) Assinaturas
+    for k, (gkey, cat_disp) in ASSINATURAS.items():
+        if k in t:
+            return GROUP_EMOJI[gkey], cat_disp
+
+    # 6) Ganhos (prioriza "vendas")
+    if "vendas" in t:
+        return GROUP_EMOJI["GANHOS"], "Vendas"
+    if "salário" in t or "salario" in t:
+        return GROUP_EMOJI["GANHOS"], "salário"
+    if re.search(r"\b(recebi|ganhei)\b", t):
+        return GROUP_EMOJI["GANHOS"], "Ganhos"
+
+    # 7) Fixos
     for k, (gkey, cat_disp) in KEYWORDS_FIXOS.items():
         if k in t:
             return GROUP_EMOJI[gkey], cat_disp
 
-    # Variáveis (mapeadas)
+    # 8) Variáveis (mapeadas)
     for k, (gkey, cat_disp) in MERCHANT_MAP.items():
         if k in t:
             return GROUP_EMOJI[gkey], cat_disp
 
-    # fallback geral
+    # 9) fallback geral
     if any(w in t for w in ["mercado", "restaurante", "lanche", "pizza", "hamburg", "sushi", "ifood", "rappi"]):
         return GROUP_EMOJI["GASTOS_VARIAVEIS"], "mercado" if "mercado" in t else "Outros"
 
@@ -812,6 +819,17 @@ def parse_natural(text: str) -> Tuple[Optional[List], Optional[str]]:
         tipo = "▲ Entrada"
     else:
         tipo = "▼ Saída"
+
+    # Em Pagamento de Fatura, forma NUNCA é "💳cartão ..."
+    if group == GROUP_EMOJI["PAG_FATURA"] and forma.startswith("💳cartão"):
+        # respeita o que o usuário informou: Pix ou débito se presentes
+        if "pix" in t_low:
+            forma = "Pix"
+        elif ("débito" in t_low) or ("debito" in t_low):
+            forma = "débito"
+        else:
+            # se não especificou, mantém como estava (mas sem cartão)
+            forma = "Outros"
 
     # Descrição: sempre vazia
     desc = ""
