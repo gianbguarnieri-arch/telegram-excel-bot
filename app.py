@@ -115,12 +115,17 @@ def licenses_db_init():
     cur.execute("""
     CREATE TABLE IF NOT EXISTS pending (
         chat_id TEXT PRIMARY KEY,
-        step TEXT,            -- 'await_license' | 'await_email'
+        step TEXT,            -- 'await_license' | 'await_email' | 'await_text_grouped'
         temp_license TEXT,
         created_at TEXT
     )""")
+    # Campos novos (idempotentes)
     try:
         cur.execute("ALTER TABLE clients ADD COLUMN email TEXT")
+    except Exception:
+        pass
+    try:
+        cur.execute("ALTER TABLE pending ADD COLUMN extra TEXT")
     except Exception:
         pass
     con.commit()
@@ -255,6 +260,24 @@ def get_pending(chat_id: str):
         return None, None
     return row[0], row[1]
 
+def set_pending_extra(chat_id: str, data: dict | None):
+    con = _db()
+    s = json.dumps(data) if data is not None else None
+    con.execute("UPDATE pending SET extra=? WHERE chat_id=?", (s, str(chat_id)))
+    con.commit(); con.close()
+
+def get_pending_extra(chat_id: str) -> dict | None:
+    con = _db()
+    cur = con.execute("SELECT extra FROM pending WHERE chat_id=?", (str(chat_id),))
+    row = cur.fetchone()
+    con.close()
+    if row and row[0]:
+        try:
+            return json.loads(row[0])
+        except Exception:
+            return None
+    return None
+
 def require_active_license(chat_id: str):
     cli = get_client(chat_id)
     if not cli:
@@ -266,7 +289,7 @@ def require_active_license(chat_id: str):
     return True, None
 
 # ===========================
-# Telegram helper
+# Telegram helpers
 # ===========================
 async def tg_send(chat_id, text):
     async with httpx.AsyncClient(timeout=12) as client:
@@ -280,6 +303,52 @@ async def tg_send(chat_id, text):
             logger.error(f"Falha ao enviar msg ao Telegram (HTTP): {e}")
         except httpx.RequestError as e:
             logger.error(f"Falha ao enviar msg ao Telegram (Request): {e}")
+
+def _tg_inline_keyboard(rows: list[list[tuple[str,str]]]):
+    inline_keyboard = []
+    for r in rows:
+        inline_keyboard.append([{"text": lbl, "callback_data": data} for (lbl, data) in r])
+    return {"inline_keyboard": inline_keyboard}
+
+async def tg_send_with_kb(chat_id, text, kb):
+    async with httpx.AsyncClient(timeout=12) as client:
+        try:
+            resp = await client.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown", "reply_markup": kb},
+            )
+            resp.raise_for_status()
+        except Exception as e:
+            logger.error(f"Falha ao enviar msg c/ teclado: {e}")
+
+# pares (label mostrado, key interna)
+GROUP_CHOICES = [
+    ("💸Gastos Variáveis",   "GASTOS_VARIAVEIS"),
+    ("🏠Gastos Fixos",       "GASTOS_FIXOS"),
+    ("📺Assinatura",         "ASSINATURA"),
+    ("🧾Despesas Temporárias","DESPESAS_TEMP"),
+    ("💳Pagamento de Fatura","PAG_FATURA"),
+    ("💵Ganhos",             "GANHOS"),
+    ("💰Investimento",       "INVESTIMENTO"),
+    ("📝Reserva",            "RESERVA"),
+    ("💲Saque/Resgate",      "SAQUE_RESGATE"),
+]
+
+def _group_keyboard():
+    rows = []
+    row = []
+    for i, (label, key) in enumerate(GROUP_CHOICES, 1):
+        row.append((label, f"grp:{key}"))
+        if i % 3 == 0:
+            rows.append(row); row = []
+    if row: rows.append(row)
+    return _tg_inline_keyboard(rows)
+
+def _group_label_by_key(k: str) -> str:
+    for lbl, key in GROUP_CHOICES:
+        if key == k:
+            return lbl
+    return "💸Gastos Variáveis"
 
 # ===========================
 # Google Auth helpers
@@ -688,9 +757,6 @@ def _extract_colon_category(text: str) -> Optional[str]:
     return None
 
 def _extract_free_text_after_keywords(text: str, keywords: List[str]) -> Optional[str]:
-    """
-    Extrai um trecho descritivo após palavras como 'reservei', 'resgatei', etc.
-    """
     t = text.strip()
     for kw in keywords:
         i = t.lower().find(kw)
@@ -724,7 +790,6 @@ def _detect_pagamento_fatura(text: str):
         brand = _titlecase(brand) if brand else "cartão"
         return GROUP_EMOJI["PAG_FATURA"], f"cartão {brand}"
 
-    # fallback genérico (se só disser "paguei a fatura" sem marca)
     return GROUP_EMOJI["PAG_FATURA"], "cartão"
 
 def _detect_saque_resgate(text: str):
@@ -740,8 +805,7 @@ def _detect_saque_resgate(text: str):
 def detect_group_and_category(text: str) -> Tuple[str, str]:
     t = text.lower()
 
-    # PRIORIDADE CORRETA:
-
+    # PRIORIDADE:
     # 1) Saque/Resgate
     grp, cat = _detect_saque_resgate(text)
     if grp: return grp, cat
@@ -753,7 +817,7 @@ def detect_group_and_category(text: str) -> Tuple[str, str]:
             cat2 = _extract_free_text_after_keywords(text, ["reservei", "reserva"]) or "Reserva"
         return GROUP_EMOJI["RESERVA"], cat2
 
-    # 3) Investimento (palavras-chave solicitadas)
+    # 3) Investimento
     if ("investi" in t) or ("investimento" in t):
         if "renda fixa" in t:
             categoria = "renda fixa"
@@ -764,7 +828,7 @@ def detect_group_and_category(text: str) -> Tuple[str, str]:
             categoria = _titlecase(_clean_trailing_tokens(m.group(1))) if m else "Investimento"
         return GROUP_EMOJI["INVESTIMENTO"], categoria
 
-    # 4) Pagamento de Fatura (apenas se houver as palavras-chave)
+    # 4) Pagamento de Fatura (apenas com palavras-chave)
     grp, cat = _detect_pagamento_fatura(text)
     if grp: return grp, cat
 
@@ -821,14 +885,12 @@ def parse_natural(text: str) -> Tuple[Optional[List], Optional[str]]:
         tipo = "▼ Saída"
 
     # Em Pagamento de Fatura, forma NUNCA é "💳cartão ..."
-    if group == GROUP_EMOJI["PAG_FATURA"] and forma.startswith("💳cartão"):
-        # respeita o que o usuário informou: Pix ou débito se presentes
+    if group == GROUP_EMOJI["PAG_FATURA"] and str(forma).startswith("💳cartão"):
         if "pix" in t_low:
             forma = "Pix"
         elif ("débito" in t_low) or ("debito" in t_low):
             forma = "débito"
         else:
-            # se não especificou, mantém como estava (mas sem cartão)
             forma = "Outros"
 
     # Descrição: sempre vazia
@@ -939,6 +1001,35 @@ async def telegram_webhook(
             return {"ok": True}
 
     body = await req.json()
+
+    # ===== CallbackQuery (botões inline) =====
+    callback = body.get("callback_query")
+    if callback:
+        cb_id = callback.get("id")
+        chat_id_cb = callback.get("message", {}).get("chat", {}).get("id")
+        data_cb = (callback.get("data") or "").strip()
+
+        # confirma ao Telegram (evita "loading...")
+        try:
+            async with httpx.AsyncClient(timeout=12) as client:
+                await client.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery",
+                    json={"callback_query_id": cb_id}
+                )
+        except Exception:
+            pass
+
+        if data_cb.startswith("grp:"):
+            grp_key = data_cb.split(":")[1]
+            set_pending(str(chat_id_cb), "await_text_grouped", None)
+            set_pending_extra(str(chat_id_cb), {"group": grp_key})
+            label = _group_label_by_key(grp_key)
+            await tg_send(chat_id_cb, f"✔️ Grupo selecionado: *{label}*.\nAgora me envie o lançamento (ex.: `59,90 no débito hoje`).")
+            return {"ok": True}
+
+        return {"ok": True}
+
+    # ===== Mensagem normal =====
     message = body.get("message") or {}
     chat_id = message.get("chat", {}).get("id")
     text = (message.get("text") or "").strip()
@@ -977,15 +1068,24 @@ async def telegram_webhook(
     # /cancel
     if text.lower() == "/cancel":
         set_pending(chat_id_str, None, None)
+        set_pending_extra(chat_id_str, None)
         await tg_send(chat_id, "Operação cancelada. Envie /start para começar novamente.")
+        return {"ok": True}
+
+    # /novo -> teclado de grupos
+    if text.lower() in ("/novo", "/lancar", "/lançar"):
+        kb = _group_keyboard()
+        await tg_send_with_kb(chat_id, "O que você quer lançar? Escolha o *grupo* abaixo:", kb)
         return {"ok": True}
 
     # /start amigável
     if text.lower() == "/start":
         record_usage(chat_id, "start")
         set_pending(chat_id_str, "await_license", None)
+        set_pending_extra(chat_id_str, None)
         await tg_send(chat_id,
             "Olá! 👋\nPor favor, *informe sua licença* (ex.: `GF-ABCD-1234`).\n\n"
+            "Você pode digitar /novo para lançar escolhendo o *grupo* pelos botões.\n"
             "Você pode digitar /cancel para cancelar."
         )
         return {"ok": True}
@@ -1033,7 +1133,7 @@ async def telegram_webhook(
             return {"ok": True}
 
         await tg_send(chat_id, f"🚀 Planilha configurada com sucesso!\n🔗 {link}")
-        await tg_send(chat_id, "Agora pode me contar seus gastos. Ex.: _gastei 45,90 no mercado via cartão hoje_")
+        await tg_send(chat_id, "Agora pode me contar seus gastos digitando livremente ou use /novo para escolher o grupo.")
         return {"ok": True}
 
     # Conversa pendente
@@ -1066,6 +1166,7 @@ async def telegram_webhook(
             logger.error(f"Falha ao atualizar e-mail da licença no Sheets: {e}")
 
         set_pending(chat_id_str, None, None)
+        set_pending_extra(chat_id_str, None)
         await tg_send(chat_id, "✅ Obrigado! Configurando sua planilha de lançamentos...")
 
         okf, errf, link = await setup_client_file(chat_id_str, email)
@@ -1075,16 +1176,66 @@ async def telegram_webhook(
             return {"ok": True}
 
         await tg_send(chat_id, f"🚀 Planilha configurada com sucesso!\n🔗 {link}")
-        await tg_send(chat_id, "Agora pode me contar seus gastos. Ex.: _gastei 45,90 no mercado via cartão hoje_")
+        await tg_send(chat_id, "Agora pode me contar seus gastos digitando livremente ou use /novo para escolher o grupo.")
         return {"ok": True}
 
-    # exige licença
+    if step == "await_text_grouped":
+        extra = get_pending_extra(chat_id_str) or {}
+        forced_group_key = extra.get("group")
+        if not forced_group_key:
+            kb = _group_keyboard()
+            await tg_send_with_kb(chat_id, "Escolha um *grupo* primeiro:", kb)
+            return {"ok": True}
+
+        ok, msg = require_active_license(chat_id_str)
+        if not ok:
+            await tg_send(chat_id, f"❗ {msg}")
+            return {"ok": True}
+
+        row, err = parse_natural(text)
+        if err:
+            await tg_send(chat_id, f"❗ {err}")
+            return {"ok": True}
+
+        # row: [data_br, tipo, group_label, category, desc, valor, forma, cond]
+        group_label = GROUP_EMOJI.get(forced_group_key, GROUP_EMOJI["GASTOS_VARIAVEIS"])
+        row[2] = group_label
+
+        # Ajusta TIPO conforme grupo
+        if forced_group_key == "INVESTIMENTO":
+            row[1] = "▼ Saída"
+        elif forced_group_key in ("SAQUE_RESGATE", "GANHOS", "PAG_FATURA"):
+            row[1] = "▲ Entrada"
+        else:
+            row[1] = "▼ Saída"
+
+        # Em pagamento de fatura, forma jamais é "💳cartão ..."
+        t_low = text.lower()
+        if forced_group_key == "PAG_FATURA" and str(row[6]).startswith("💳cartão"):
+            if "pix" in t_low:
+                row[6] = "Pix"
+            elif ("débito" in t_low) or ("debito" in t_low):
+                row[6] = "débito"
+            else:
+                row[6] = "Outros"
+
+        try:
+            add_row_to_client(row, chat_id_str)
+            set_pending(chat_id_str, None, None)
+            set_pending_extra(chat_id_str, None)
+            await tg_send(chat_id, "✅ Lançado!")
+        except Exception as e:
+            logger.error(f"Erro ao lançar forçado por grupo: {e}")
+            await tg_send(chat_id, f"❌ Erro ao lançar na planilha: {e}")
+        return {"ok": True}
+
+    # exige licença (modo texto livre sem /novo)
     ok, msg = require_active_license(chat_id_str)
     if not ok:
         await tg_send(chat_id, f"❗ {msg}")
         return {"ok": True}
 
-    # Lançamento
+    # Lançamento modo livre
     row, err = parse_natural(text)
     if err:
         await tg_send(chat_id, f"❗ {err}")
