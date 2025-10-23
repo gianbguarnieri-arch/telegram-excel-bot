@@ -351,10 +351,21 @@ def detect_payment(text: str) -> str:
     return "Outros"
 
 def detect_installments(text: str) -> str:
-    t = text.lower()
-    if "parcelad" in t: return "parcelado"
-    if re.search(r"\b\d+x\b", t): return "parcelado"
+    t = text.lower().replace(" ", "")
+    # Busca formatos como 2x, 3x, 10x, 12x etc.
+    match = re.search(r"(\d{1,2})x", t)
+    if match:
+        return f"{match.group(1)}x"
+    # Busca "parcelado em 10x" ou "em 12x"
+    match2 = re.search(r"parceladoem(\d{1,2})x", t)
+    if match2:
+        return f"{match2.group(1)}x"
+    # Se for citado "parcelado" mas sem número, assume parcelado genérico
+    if "parcelad" in t:
+        return "parcelado"
+    # Padrão default
     return "à vista"
+
 
 def _category_before_comma(text: str) -> Optional[str]:
     if not text:
