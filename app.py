@@ -73,6 +73,74 @@ LICENSE_SHEET_ID = os.getenv("LICENSE_SHEET_ID")
 LICENSE_SHEET_TAB = os.getenv("LICENSE_SHEET_TAB", "Licencas")
 
 # ===========================
+# OAuth helper + routes
+# ===========================
+def _client_config_dict():
+    return {
+        "web": {
+            "client_id": GOOGLE_OAUTH_CLIENT_ID,
+            "client_secret": GOOGLE_OAUTH_CLIENT_SECRET,
+            "redirect_uris": [GOOGLE_OAUTH_REDIRECT_URI],
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+        }
+    }
+
+def _save_credentials(creds: Credentials):
+    data = {
+        "token": creds.token,
+        "refresh_token": creds.refresh_token,
+        "token_uri": creds.token_uri,
+        "client_id": creds.client_id,
+        "client_secret": creds.client_secret,
+        "scopes": creds.scopes,
+    }
+    os.makedirs(os.path.dirname(GOOGLE_TOKEN_PATH), exist_ok=True)
+    with open(GOOGLE_TOKEN_PATH, "w") as f:
+        json.dump(data, f)
+
+@app.get("/oauth/start")
+def oauth_start():
+    if not GOOGLE_USE_OAUTH:
+        return HTMLResponse("<h3>OAuth desabilitado. Defina GOOGLE_USE_OAUTH=1.</h3>", status_code=400)
+    if not (GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET and GOOGLE_OAUTH_REDIRECT_URI):
+        return HTMLResponse("<h3>Faltam variáveis do OAuth no ambiente.</h3>", status_code=500)
+
+    flow = Flow.from_client_config(
+        _client_config_dict(),
+        scopes=GOOGLE_OAUTH_SCOPES,
+        redirect_uri=GOOGLE_OAUTH_REDIRECT_URI
+    )
+    auth_url, _state = flow.authorization_url(
+        access_type="offline",
+        include_granted_scopes="true",
+        prompt="consent",
+        state=OAUTH_STATE_SECRET,
+    )
+    return RedirectResponse(auth_url)
+
+@app.get("/oauth/callback")
+def oauth_callback(code: str | None = None, state: str | None = None):
+    if not GOOGLE_USE_OAUTH:
+        return HTMLResponse("<h3>OAuth desabilitado. Defina GOOGLE_USE_OAUTH=1.</h3>", status_code=400)
+    if state != OAUTH_STATE_SECRET:
+        return HTMLResponse("<h3>State inválido.</h3>", status_code=400)
+    if not code:
+        return HTMLResponse("<h3>Faltou 'code' na URL.</h3>", status_code=400)
+
+    flow = Flow.from_client_config(
+        _client_config_dict(),
+        scopes=GOOGLE_OAUTH_SCOPES,
+        redirect_uri=GOOGLE_OAUTH_REDIRECT_URI
+    )
+    flow.fetch_token(code=code)
+    creds = flow.credentials
+    if not creds.refresh_token:
+        return HTMLResponse("<h3>Não veio refresh_token. Refazer /oauth/start.</h3>", status_code=400)
+
+    _save_credentials(creds)
+    return HTMLResponse("<h3>✅ OAuth ok! Pode voltar ao Telegram.</h3>")
+# ===========================
 # DB
 # ===========================
 def _db():
@@ -156,6 +224,7 @@ def get_pending(chat_id: str) -> tuple[Optional[str], Optional[str]]:
     if not row:
         return None, None
     return row[0], row[1]
+
 # ===========================
 # Botões de grupo (inline keyboard)
 # ===========================
@@ -183,7 +252,8 @@ def _group_keyboard_rows():
     for i, (label, key) in enumerate(GROUP_CHOICES, 1):
         row.append({"text": label, "callback_data": f"grp:{key}"})
         if i % 3 == 0:
-            rows.append(row); row = []
+            rows.append(row)
+            row = []
     if row:
         rows.append(row)
     return rows
@@ -213,7 +283,8 @@ def _ensure_group_state_table():
             updated_at TEXT
         )
     """)
-    con.commit(); con.close()
+    con.commit()
+    con.close()
 
 def set_selected_group(chat_id: str, group_key: Optional[str]):
     _ensure_group_state_table()
@@ -226,7 +297,8 @@ def set_selected_group(chat_id: str, group_key: Optional[str]):
             VALUES(?,?,?)
             ON CONFLICT(chat_id) DO UPDATE SET group_key=excluded.group_key, updated_at=excluded.updated_at
         """, (str(chat_id), group_key, _now_iso()))
-    con.commit(); con.close()
+    con.commit()
+    con.close()
 
 def get_selected_group(chat_id: str) -> Optional[str]:
     _ensure_group_state_table()
@@ -235,24 +307,17 @@ def get_selected_group(chat_id: str) -> Optional[str]:
     row = cur.fetchone()
     con.close()
     return row[0] if row else None
-
 # ===========================
 # Parsing helpers
 # ===========================
-# (garante fuso local caso Parte 1 não tenha APP_TZ/_local_today definidos)
-try:
-    APP_TZ
-except NameError:
-    APP_TZ = os.getenv("APP_TZ", "America/Sao_Paulo")
-try:
-    _local_today
-except NameError:
-    from zoneinfo import ZoneInfo
-    def _local_today():
-        try:
-            return datetime.now(ZoneInfo(APP_TZ)).date()
-        except Exception:
-            return datetime.now().date()
+from zoneinfo import ZoneInfo
+APP_TZ = os.getenv("APP_TZ", "America/Sao_Paulo")
+
+def _local_today():
+    try:
+        return datetime.now(ZoneInfo(APP_TZ)).date()
+    except Exception:
+        return datetime.now().date()
 
 def _titlecase(s: str) -> str:
     return " ".join(w.capitalize() for w in s.split())
@@ -273,9 +338,6 @@ def _format_date_br(d: datetime.date) -> str:
     return d.strftime("%d/%m/%Y")
 
 def parse_date(text: str) -> Optional[str]:
-    """
-    'hoje' / 'ontem' com fuso local e dd/mm[/aa|aaaa]
-    """
     t = text.lower()
     today = _local_today()
     if "hoje" in t:
@@ -294,11 +356,8 @@ def parse_date(text: str) -> Optional[str]:
     return None
 
 def parse_money(text: str) -> Optional[float]:
-    """
-    Extrai o último número, ignorando datas; normaliza '12 x'→'12x' mas usa apenas número monetário.
-    """
     t = text.lower().replace("r$", " ").replace("reais", " ")
-    t = re.sub(r"\b\d{1,2}[\/\-.]\d{1,2}(?:[\/\-.]\d{2,4})?\b", " ", t)  # remove datas
+    t = re.sub(r"\b\d{1,2}[\/\-.]\d{1,2}(?:[\/\-.]\d{2,4})?\b", " ", t)
     matches = re.findall(
         r"\b\d{1,3}(?:[.\s]\d{3})*(?:,\d{1,2})\b|\b\d+(?:[.,]\d{1,2})\b|\b\d+\b",
         t
@@ -316,11 +375,6 @@ def parse_money(text: str) -> Optional[float]:
         return None
 
 def detect_payment(text: str) -> str:
-    """
-    Forma de pagamento:
-      - "cartão X" → "💳cartão X" (limpa 'hoje', 'via' etc. do final)
-      - Pix / débito / crédito / Outros
-    """
     t = text.lower()
     m = re.search(r"cart[aã]o\s+([a-z0-9 ]+)", t)
     if m:
@@ -336,31 +390,22 @@ def detect_payment(text: str) -> str:
 
 def detect_installments(text: str) -> str:
     """
-    CONDIÇÃO de pagamento:
-      - "à vista" se houver "à vista", "a vista" ou "avista"
-      - "Nx" quando houver padrão de parcelamento, com ou sem espaço antes do 'x':
-          "em 10x", "10x", "parcelado em 12x", "21 x", "em 3 x", "parcelada 4 x"
-      - Sempre normaliza para "Nx" (sem espaço), ex.: "12 x" -> "12x"
+    Condição de pagamento:
+      - "à vista" se a frase contiver "à vista", "a vista" ou "avista"
+      - "Nx" quando houver padrão de parcelamento (com ou sem espaço antes do 'x')
+        Ex.: "em 10x", "10x", "parcelado em 12x", "21 x", "em 3 x"
+      - Sempre normaliza para "Nx" (sem espaço)
     """
     t = text.lower()
-
-    # à vista explícito
     if re.search(r"\b(a\s+vista|à\s+vista|avista)\b", t):
         return "à vista"
-
-    # procura quantidade de parcelas (1–2 dígitos) seguido de 'x', com/sem espaço e com/sem "parcelado/em"
     m = re.search(r"(?:parcelad[oa]\s*(?:em)?\s*|em\s*)?(\d{1,2})\s*x\b", t)
     if m:
         n = int(m.group(1))
         return f"{n}x"
-
-    # nenhum indicativo de parcelamento
     return "à vista"
 
 def _category_before_comma(text: str) -> Optional[str]:
-    """
-    Tudo antes da primeira vírgula é a categoria.
-    """
     if not text:
         return None
     parts = text.split(",", 1)
@@ -375,7 +420,7 @@ def _category_before_comma(text: str) -> Optional[str]:
     return _titlecase(cat)
 
 # ===========================
-# Mapeamento visual dos grupos (sem espaço após emoji)
+# NLP (modo texto livre)
 # ===========================
 GROUP_EMOJI = {
     "GASTOS_FIXOS":      "🏠Gastos Fixos",
@@ -389,298 +434,58 @@ GROUP_EMOJI = {
     "SAQUE_RESGATE":     "💲Saque/Resgate",
 }
 
-# ===========================
-# NLP (modo texto livre)
-# ===========================
 def detect_group_and_category_free(text: str) -> Tuple[str, str]:
     t = text.lower()
-
     # Saque / Resgate
-    if any(w in t for w in ["saquei", "saque ", "resgatei", "resgate "]):
+    if any(w in t for w in ["saquei", "resgatei", "resgate "]):
         cat = _category_before_comma(text) or "Saque/Resgate"
         return GROUP_EMOJI["SAQUE_RESGATE"], cat
-
     # Reserva
     if "reservei" in t or "reserva" in t:
         cat = _category_before_comma(text) or "Reserva"
         return GROUP_EMOJI["RESERVA"], cat
-
     # Investimento
-    if ("investi" in t) or ("investimento" in t):
-        cat = _category_before_comma(text)
-        if not cat:
-            if "renda fixa" in t: cat = "Renda Fixa"
-            elif "aç" in t or "aco" in t or "ações" in t or "acoes" in t: cat = "Ações"
-            else: cat = "Investimento"
+    if "investi" in t or "investimento" in t:
+        cat = _category_before_comma(text) or "Investimento"
         return GROUP_EMOJI["INVESTIMENTO"], cat
-
-    # Pagamento de Fatura (apenas com keywords explícitas)
-    if ("pagamento de fatura" in t) or ("paguei a fatura" in t):
-        cat = _category_before_comma(text)
-        if not cat:
-            m = re.search(r"cart[aã]o\s+([a-z0-9 ]+)", t)
-            cat = f"Cartão {_titlecase(m.group(1))}" if m and m.group(1) else "Cartão"
+    # Pagamento de Fatura (só com termos específicos)
+    if "pagamento de fatura" in t or "paguei a fatura" in t:
+        cat = _category_before_comma(text) or "Cartão"
         return GROUP_EMOJI["PAG_FATURA"], cat
-
-    # Ganhos — prioriza Vendas
-    if "vendas" in t: return GROUP_EMOJI["GANHOS"], "Vendas"
-    if "salário" in t or "salario" in t: return GROUP_EMOJI["GANHOS"], "Salário"
-    if re.search(r"\b(recebi|ganhei)\b", t): return GROUP_EMOJI["GANHOS"], "Ganhos"
-
-    # Assinaturas (nomes comuns)
-    assin = ["netflix", "amazon", "prime video", "disney", "disney+", "globoplay", "spotify", "hbo", "max", "apple tv", "youtube premium"]
+    # Ganhos
+    if "vendas" in t:
+        return GROUP_EMOJI["GANHOS"], "Vendas"
+    if "salário" in t or "salario" in t:
+        return GROUP_EMOJI["GANHOS"], "Salário"
+    if "recebi" in t or "ganhei" in t:
+        return GROUP_EMOJI["GANHOS"], "Ganhos"
+    # Assinaturas
+    assin = ["netflix", "amazon", "prime video", "disney", "disney+", "spotify", "globoplay", "youtube premium"]
     for a in assin:
         if a in t:
-            return GROUP_EMOJI["ASSINATURA"], _titlecase(a.replace("+", "+"))
-
+            return GROUP_EMOJI["ASSINATURA"], _titlecase(a)
     # Fixos
-    if "aluguel" in t:  return GROUP_EMOJI["GASTOS_FIXOS"], "Aluguel"
+    if "aluguel" in t: return GROUP_EMOJI["GASTOS_FIXOS"], "Aluguel"
     if "água" in t or "agua" in t: return GROUP_EMOJI["GASTOS_FIXOS"], "Agua"
     if "energia" in t or "luz" in t: return GROUP_EMOJI["GASTOS_FIXOS"], "Energia"
-    if "internet" in t: return GROUP_EMOJI["GASTOS_FIXOS"], "Internet"
-    if "condomínio" in t or "condominio" in t: return GROUP_EMOJI["GASTOS_FIXOS"], "Condomínio"
-
-    # Variáveis comuns
-    if "ifood" in t: return GROUP_EMOJI["GASTOS_VARIAVEIS"], "ifood"
-    if "mercado" in t: return GROUP_EMOJI["GASTOS_VARIAVEIS"], "mercado"
-    if any(w in t for w in ["restaurante","lanche","pizza","hamburg","sushi","rappi","uber","99"]):
-        return GROUP_EMOJI["GASTOS_VARIAVEIS"], _category_before_comma(text) or "Outros"
-
-    # Fallback → Variáveis
+    # Variáveis
+    if "ifood" in t or "mercado" in t:
+        return GROUP_EMOJI["GASTOS_VARIAVEIS"], "Mercado"
+    # fallback
     return GROUP_EMOJI["GASTOS_VARIAVEIS"], _category_before_comma(text) or "Outros"
 
 def parse_natural(text: str) -> Tuple[Optional[List], Optional[str]]:
-    """
-    Saída para planilha:
-      [data_br, tipo, group_label, category, desc, valor, forma, cond]
-    """
     valor = parse_money(text)
     if valor is None:
-        return None, "Não achei o valor. Ex.: 45,90"
-
-    data_br = parse_date(text) or _local_today().strftime("%d/%m/%Y")
+        return None, "Não achei o valor."
+    data_br = parse_date(text) or _format_date_br(_local_today())
     forma = detect_payment(text)
     cond = detect_installments(text)
-
-    group_label, category = detect_group_and_category_free(text)
-
-    # Em Pagamento de Fatura, forma nunca é "💳cartão ..."
-    if group_label == GROUP_EMOJI["PAG_FATURA"] and str(forma).startswith("💳cartão"):
-        t_low = text.lower()
-        if "pix" in t_low: forma = "Pix"
-        elif ("débito" in t_low) or ("debito" in t_low): forma = "débito"
-        else: forma = "Outros"
-
-    # Tipo por grupo (fatura = sempre saída)
-    if group_label == GROUP_EMOJI["INVESTIMENTO"]:
-        tipo = "▼ Saída"
-    elif group_label in (GROUP_EMOJI["SAQUE_RESGATE"], GROUP_EMOJI["GANHOS"]):
+    grupo, categoria = detect_group_and_category_free(text)
+    # tipo (entrada/saída)
+    if grupo in (GROUP_EMOJI["GANHOS"], GROUP_EMOJI["SAQUE_RESGATE"]):
         tipo = "▲ Entrada"
-    elif group_label == GROUP_EMOJI["PAG_FATURA"]:
-        tipo = "▼ Saída"
     else:
         tipo = "▼ Saída"
-
-    desc = ""  # sempre vazio
-
-    return [data_br, tipo, group_label, category, desc, float(valor), forma, cond], None
-# ===========================
-# Google Auth helpers
-# ===========================
-def _build_service_sheets():
-    creds = None
-    if GOOGLE_USE_OAUTH and os.path.exists(GOOGLE_TOKEN_PATH):
-        creds = Credentials.from_authorized_user_file(GOOGLE_TOKEN_PATH, GOOGLE_OAUTH_SCOPES)
-    elif GOOGLE_SA_JSON:
-        info = json.loads(GOOGLE_SA_JSON)
-        creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES_SA)
-    if not creds:
-        raise RuntimeError("Nenhuma credencial Google configurada.")
-    return build("sheets", "v4", credentials=creds)
-
-def _build_service_drive():
-    creds = None
-    if GOOGLE_USE_OAUTH and os.path.exists(GOOGLE_TOKEN_PATH):
-        creds = Credentials.from_authorized_user_file(GOOGLE_TOKEN_PATH, GOOGLE_OAUTH_SCOPES)
-    elif GOOGLE_SA_JSON:
-        info = json.loads(GOOGLE_SA_JSON)
-        creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES_SA)
-    if not creds:
-        raise RuntimeError("Nenhuma credencial Google configurada.")
-    return build("drive", "v3", credentials=creds)
-
-# ===========================
-# Sheets / Drive actions
-# ===========================
-def sheet_append_row(sheet_id: str, tab: str, row: list):
-    service = _build_service_sheets()
-    range_ = f"{tab}!{SHEET_FIRST_COL}{SHEET_START_ROW}:{SHEET_LAST_COL}"
-    body = {"values": [row]}
-    service.spreadsheets().values().append(
-        spreadsheetId=sheet_id,
-        range=range_,
-        valueInputOption="USER_ENTERED",
-        body=body
-    ).execute()
-
-def sheet_update_license_email(license_key: str, email: str):
-    if not LICENSE_SHEET_ID:
-        return
-    service = _build_service_sheets()
-    values = service.spreadsheets().values().get(
-        spreadsheetId=LICENSE_SHEET_ID,
-        range=f"{LICENSE_SHEET_TAB}!A:F"
-    ).execute().get("values", [])
-    for i, row in enumerate(values, start=1):
-        if row and row[0] == license_key:
-            rng = f"{LICENSE_SHEET_TAB}!E{i}"
-            service.spreadsheets().values().update(
-                spreadsheetId=LICENSE_SHEET_ID,
-                range=rng,
-                valueInputOption="RAW",
-                body={"values": [[email]]}
-            ).execute()
-            return
-
-async def setup_client_file(chat_id: str, email: str):
-    try:
-        service_drive = _build_service_drive()
-        # copia arquivo modelo
-        copy = service_drive.files().copy(
-            fileId=GS_TEMPLATE_ID,
-            body={
-                "parents": [GS_DEST_FOLDER_ID],
-                "name": f"Planilha - {email}",
-            }
-        ).execute()
-        fid = copy["id"]
-        # compartilhar
-        service_drive.permissions().create(
-            fileId=fid,
-            body={"type": "user", "role": SHARE_LINK_ROLE, "emailAddress": email},
-            sendNotificationEmail=True
-        ).execute()
-        link = f"https://docs.google.com/spreadsheets/d/{fid}"
-        return True, None, link
-    except Exception as e:
-        return False, str(e), None
-
-# ===========================
-# Telegram Webhook
-# ===========================
-@app.post("/telegram/webhook")
-async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: Optional[str] = Header(None)):
-    if TELEGRAM_WEBHOOK_SECRET and x_telegram_bot_api_secret_token != TELEGRAM_WEBHOOK_SECRET:
-        return {"ok": False, "error": "unauthorized"}
-
-    data = await request.json()
-    message = data.get("message") or data.get("callback_query", {}).get("message")
-    if not message:
-        return {"ok": True}
-
-    chat_id = str(message["chat"]["id"])
-    text = (
-        data.get("message", {}).get("text")
-        or data.get("callback_query", {}).get("data")
-        or ""
-    ).strip()
-
-    # Callback de grupo
-    if text.startswith("grp:"):
-        group_key = text.split(":", 1)[1]
-        set_selected_group(chat_id, group_key)
-        example = GROUP_EXAMPLE.get(group_key, "Mercado, 59,90 no débito hoje")
-        await tg_send(chat_id, f"✔ Grupo selecionado: {_group_label_by_key(group_key)}.\nAgora me envie o lançamento (ex.: *{example}*)")
-        return {"ok": True}
-
-    # /start
-    if text.lower() == "/start":
-        record_usage(chat_id, "start")
-        set_selected_group(chat_id, None)
-        set_pending(chat_id, "await_license", None)
-        await tg_send(chat_id, "Olá! 👋\nPor favor, *informe sua licença* para começar (ex.: `GF-ABCD-1234`).")
-        return {"ok": True}
-
-    # /novo → mostrar botões
-    if text.lower() == "/novo":
-        kb = _group_keyboard_rows()
-        await tg_send_with_kb(chat_id, "Escolha o grupo do lançamento:", kb)
-        return {"ok": True}
-
-    # /cancel
-    if text.lower() == "/cancel":
-        set_selected_group(chat_id, None)
-        set_pending(chat_id, None, None)
-        await tg_send(chat_id, "Operação cancelada. Envie /start para recomeçar.")
-        return {"ok": True}
-
-    # Etapas pendentes
-    step, temp_license = get_pending(chat_id)
-    if step == "await_license":
-        lic = text.strip()
-        con = _db(); cur = con.execute("SELECT license_key,status FROM licenses WHERE license_key=?", (lic,))
-        row = cur.fetchone(); con.close()
-        if not row:
-            await tg_send(chat_id, "❌ Licença inválida. Tente novamente ou digite /cancel.")
-            return {"ok": True}
-        status = row[1]
-        if status != "active":
-            await tg_send(chat_id, f"❌ Esta licença está {status}.")
-            return {"ok": True}
-        con = _db()
-        con.execute("INSERT OR REPLACE INTO clients(chat_id,license_key,created_at,last_seen_at) VALUES(?,?,?,?)",
-                    (chat_id, lic, _now_iso(), _now_iso()))
-        con.commit(); con.close()
-        set_pending(chat_id, "await_email", lic)
-        await tg_send(chat_id, "Licença ok ✅\nAgora me diga seu *e-mail* (ex.: `cliente@gmail.com`).")
-        return {"ok": True}
-
-    if step == "await_email":
-        email = text.strip()
-        if not re.match(r"[^@]+@[^@]+\.[^@]+", email):
-            await tg_send(chat_id, "❗ E-mail inválido. Tente novamente.")
-            return {"ok": True}
-        con = _db()
-        con.execute("UPDATE clients SET email=?, last_seen_at=? WHERE chat_id=?", (email, _now_iso(), chat_id))
-        con.commit(); con.close()
-        try:
-            sheet_update_license_email(temp_license, email)
-        except Exception as e:
-            logger.error(f"Erro ao atualizar email no Sheets: {e}")
-        set_pending(chat_id, None, None)
-        ok, err, link = await setup_client_file(chat_id, email)
-        if not ok:
-            await tg_send(chat_id, f"❌ Erro ao criar planilha: {err}")
-            return {"ok": True}
-        await tg_send(chat_id, f"🚀 Planilha criada com sucesso!\n🔗 {link}")
-        await tg_send(chat_id, "Você pode digitar seus lançamentos (ex.: `Mercado, 59 no débito hoje`)\nOu usar */novo* para escolher o grupo.")
-        return {"ok": True}
-
-    # Pega grupo selecionado
-    grp = get_selected_group(chat_id)
-
-    # Parseia lançamento
-    parsed, err = parse_natural(text)
-    if err:
-        await tg_send(chat_id, f"❌ {err}")
-        return {"ok": True}
-
-    data_br, tipo, grupo, categoria, desc, valor, forma, cond = parsed
-    # se o usuário escolheu grupo, sobrescreve
-    if grp:
-        grupo = _group_label_by_key(grp)
-
-    try:
-        if LICENSE_SHEET_ID:
-            sheet_append_row(LICENSE_SHEET_ID, WORKSHEET_NAME,
-                             [data_br, tipo, grupo, categoria, desc, valor, forma, cond])
-        await tg_send(chat_id, f"✅ Lançamento registrado:\n• {grupo}\n• {categoria}\n• R${valor:,.2f}\n• {forma} - {cond}\n• {data_br}")
-        await tg_send_with_kb(chat_id, "📌 Novo lançamento?", _group_keyboard_rows())
-    except Exception as e:
-        logger.error(f"Erro ao lançar: {e}")
-        await tg_send(chat_id, f"❌ Erro ao registrar lançamento: {e}")
-    return {"ok": True}
-
-@app.get("/")
-async def root():
-    return HTMLResponse("<h3>Bot de Lançamentos ativo ✅</h3>")
+    desc = ""
+    return [data_br, tipo, grupo, categoria, desc, valor, forma, cond], None
