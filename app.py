@@ -199,6 +199,7 @@ async def tg_send_with_kb(chat_id, text, keyboard):
             )
         except Exception as e:
             logger.error(f"Erro ao enviar msg com teclado: {e}")
+
 # ===========================
 # Botões de grupo (inline keyboard)
 # ===========================
@@ -335,38 +336,90 @@ def parse_money(text: str) -> Optional[float]:
         return float(raw)
     except:
         return None
-
 def detect_payment(text: str) -> str:
+    """
+    Forma de pagamento com padronização:
+      - Pix [+ Banco]  => "Pix" ou "Pix Bradesco"
+      - Débito [+ Banco] => "Débito" ou "Débito Sicredi"
+      - Cartão => "💳cartão Nubank" (comportamento existente)
+    Regras:
+      • Primeira letra maiúscula em cada palavra (Pix, Débito, Santander...)
+      • Sem espaços extras no início/fim
+      • Banco capturado logo após 'pix'/'débito' (via pix BRADESCO / no debito sicredi)
+    """
     t = text.lower()
-    m = re.search(r"cart[aã]o\s+([a-z0-9 ]+)", t)
-    if m:
-        brand = re.sub(r"\s+", " ", m.group(1)).strip()
+
+    # --- Cartão (mantém lógica original) ---
+    m_card = re.search(r"cart[aã]o\s+([a-z0-9 ]+)", t)
+    if m_card:
+        brand = re.sub(r"\s+", " ", m_card.group(1)).strip()
         brand = _clean_trailing_tokens(brand)
         if brand:
             return f"💳cartão {_titlecase(brand)}"
         return "💳cartão"
-    if "pix" in t: return "Pix"
-    if "débito" in t or "debito" in t: return "débito"
-    if "crédito" in t or "credito" in t: return "crédito"
+
+    # --- Pix (com/sem banco) ---
+    if "pix" in t:
+        # captura um possível banco logo após a palavra 'pix'
+        # exemplos válidos: "via pix bradesco", "pix itau", "pix sicredi hoje"
+        m_pix_bank = re.search(r"pix\s+([a-z0-9][a-z0-9\s]{0,30})", t)
+        bank = ""
+        if m_pix_bank:
+            candidate = re.sub(r"\s+", " ", m_pix_bank.group(1)).strip()
+            # remove caudas como 'hoje/ontem/via/no/na/em/de/da' etc.
+            candidate = _clean_trailing_tokens(candidate)
+            # se ainda sobrou algo e não começa com dígito, assume banco
+            if candidate and not re.match(r"^\d", candidate):
+                # limita para até duas palavras (ex.: 'banco inter' -> 'Banco Inter')
+                parts = candidate.split()
+                bank = " ".join(parts[:2])
+        return ("Pix " + _titlecase(bank)).strip()
+
+    # --- Débito (com/sem banco) ---
+    if ("débito" in t) or ("debito" in t):
+        # variações: "no debito sicredi", "no débito itau", "debito bradesco"
+        m_deb_bank = re.search(r"debito\s+([a-z0-9][a-z0-9\s]{0,30})", t) or \
+                     re.search(r"d[eé]bito\s+([a-z0-9][a-z0-9\s]{0,30})", t)
+        bank = ""
+        if m_deb_bank:
+            candidate = re.sub(r"\s+", " ", m_deb_bank.group(1)).strip()
+            candidate = _clean_trailing_tokens(candidate)
+            if candidate and not re.match(r"^\d", candidate):
+                parts = candidate.split()
+                bank = " ".join(parts[:2])
+        return ("Débito " + _titlecase(bank)).strip()
+
+    # fallback
     return "Outros"
 
-def detect_installments(text: str) -> str:
-    t = text.lower().replace(" ", "")
-    # Busca formatos como 2x, 3x, 10x, 12x etc.
-    match = re.search(r"(\d{1,2})x", t)
-    if match:
-        return f"{match.group(1)}x"
-    # Busca "parcelado em 10x" ou "em 12x"
-    match2 = re.search(r"parceladoem(\d{1,2})x", t)
-    if match2:
-        return f"{match2.group(1)}x"
-    # Se for citado "parcelado" mas sem número, assume parcelado genérico
-    if "parcelad" in t:
-        return "parcelado"
-    # Padrão default
+
+def detect_installments(text: str, forma_pagamento: Optional[str] = None) -> str:
+    """
+    Condição de pagamento:
+      - Para Pix/Débito => sempre 'à vista'
+      - Para Cartão => detecta parcelamento e normaliza:
+          "em 10x", "10x", "parcelado em 12x", "21 x", "em 3 x" -> "Nx" (sem espaço)
+      - Caso nada detectado => 'à vista'
+    """
+    # Pix / Débito => sempre à vista
+    if forma_pagamento:
+        fp = forma_pagamento.strip()
+        if fp.startswith("Pix") or fp.startswith("Débito"):
+            return "à vista"
+
+    t = text.lower()
+
+    # à vista explícito (qualquer variação)
+    if re.search(r"\b(a\s+vista|à\s+vista|avista)\b", t):
+        return "à vista"
+
+    # procura quantidade de parcelas (1–2 dígitos) seguido de 'x'
+    m = re.search(r"(?:parcelad[oa]\s*(?:em)?\s*|em\s*)?(\d{1,2})\s*x\b", t)
+    if m:
+        n = int(m.group(1))
+        return f"{n}x"
+
     return "à vista"
-
-
 def _category_before_comma(text: str) -> Optional[str]:
     if not text:
         return None
@@ -462,7 +515,7 @@ def parse_natural(text: str) -> Tuple[Optional[List], Optional[str]]:
 
     data_br = parse_date(text) or _local_today().strftime("%d/%m/%Y")
     forma = detect_payment(text)
-    cond = detect_installments(text)
+    cond = detect_installments(text, forma_pagamento=forma)
 
     group_label, category = detect_group_and_category_free(text)
 
@@ -609,7 +662,7 @@ def sheets_append_row(spreadsheet_id: str, sheet_name: str, values: List):
     rng = f"{sheet_name}!{SHEET_FIRST_COL}{SHEET_START_ROW}:{SHEET_LAST_COL}"
     body = {"values": [values]}
     sheets.spreadsheets().values().append(
-        spreadsheetId=spreadsheet_id,
+        spreadsheetId=spreadsheets_id if False else spreadsheet_id,  # não alterar
         range=rng,
         valueInputOption="USER_ENTERED",
         insertDataOption="OVERWRITE",
